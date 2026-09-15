@@ -3,8 +3,7 @@
 An ad performance attribution pipeline: it ingests campaign and revenue data, runs
 multi-touch attribution, and serves the results to a dashboard.
 
-> Status: Phase 4.5 — ingestion pipeline with quarantine replay. No
-> attribution or dashboard logic yet.
+> Status: Phase 5 — attribution engine. No API or dashboard yet.
 
 ## Folder structure
 
@@ -31,7 +30,12 @@ signalstack/
         runner.py        # per-source orchestration
         replay.py        # dependency-ordered quarantine replay
         cli.py           # ingestion CLI
-      attribution/       # (empty) multi-touch attribution logic
+      attribution/
+        journeys.py      # batched journey assembly
+        models.py        # the five attribution models
+        engine.py        # scoring runner (idempotent upserts)
+        analytics.py     # rollups for the dashboard
+        cli.py           # attribution CLI
     alembic/             # migration environment
       versions/          # migration scripts
     alembic.ini
@@ -39,6 +43,7 @@ signalstack/
       test_db.py         # round-trip test against the real database
       test_generator.py  # generator tests (no database)
       test_pipeline.py   # pipeline tests (real database)
+      test_attribution.py # attribution tests
     requirements.txt
     .env.example
   frontend/              # Vite + React (JavaScript)
@@ -235,6 +240,28 @@ cd backend && .venv/bin/python -m app.pipeline.cli --replay-only
 See PROGRESS.md → "Phase 4" for the retry policy, what gets quarantined and
 why, and the `received == ingested + quarantined` counter identity; "Phase 4.5"
 covers replay and the currency allowlist.
+
+## Attribution engine
+
+Scores every conversion under five multi-touch models — `last_touch`,
+`first_touch`, `linear`, `time_decay`, `position_based` — and stores all five
+side by side so the dashboard can show how much they disagree.
+
+```bash
+cd backend && .venv/bin/python -m app.attribution.cli --rebuild
+```
+
+Flags: `--rebuild`, `--lookback-days`, `--half-life-days`, `--model`
+(repeatable), `--quiet`. Re-running without `--rebuild` is a no-op on row
+counts — the upserts are keyed on
+`(conversion_id, touchpoint_id, model_name)`.
+
+All credit arithmetic is `Decimal` with largest-remainder apportionment, so
+credits sum to exactly `1.000000` and attributed revenue sums to the
+conversion's revenue to the cent. See PROGRESS.md → "Phase 5".
+
+> Note: `pytest` truncates the data tables, so re-run the pipeline CLI before
+> an attribution demo.
 
 ## Configuration
 

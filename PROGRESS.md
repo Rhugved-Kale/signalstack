@@ -685,3 +685,152 @@ truncate the quarantine you are asking it to replay.
    the loader did not reject is treated as recovered, including one dropped as
    an in-batch duplicate — its twin carried the data into the table, so the
    quarantine row is genuinely obsolete.
+
+## Phase 5 — Attribution engine
+
+Date: 2026-09-14
+
+Scope: the attribution engine and its rollups. No API endpoints, no frontend —
+Phase 6 wraps `analytics.py`.
+
+### Files added
+
+- `backend/app/attribution/journeys.py` — batched journey assembly.
+- `backend/app/attribution/models.py` — the five models + exact apportionment.
+- `backend/app/attribution/engine.py` — scoring runner with idempotent upserts.
+- `backend/app/attribution/analytics.py` — five read-only rollups.
+- `backend/app/attribution/cli.py` — `python -m app.attribution.cli`.
+- `backend/tests/test_attribution.py` — 251 tests.
+
+### The five models, and what each believes about marketing
+
+| Model | Rule | Implicit assumption | Who it flatters |
+| --- | --- | --- | --- |
+| `last_touch` | 100% to the final touch | whatever closed the sale caused it | late funnel (paid search, email) |
+| `first_touch` | 100% to the first touch | discovery is everything, nurture is free | early funnel (display, social) |
+| `linear` | equal split | no touch matters more than another | long journeys, mid funnel |
+| `time_decay` | `0.5 ** (hours_before / half_life)`, half-life 7 days | influence fades with time | recent touches, whatever they are |
+| `position_based` | 40% first, 40% last, 20% shared by the middle | discovery and closing are the hard parts | both ends, penalises the middle |
+
+Special cases for `position_based`: one touchpoint takes 100%, two split
+50/50 (there is no middle to pay).
+
+**The whole point is that they disagree.** On the seed-42 dataset, display is
+worth \$2,220 under `last_touch` and \$57,931 under `first_touch` — a 26x
+spread on identical data, because Phase 3 deliberately biased display toward
+the *start* of journeys. `paid_search` swings the opposite way (\$42,608 vs
+\$1,067). Total disputed revenue across channels is \$163,305 against
+\$124,804 attributed, so on average every dollar's owner is contested.
+
+### Exactness: largest-remainder apportionment
+
+Credits and revenue are apportioned, not multiplied-and-rounded:
+
+1. Convert the model's raw weights into integer units — 10^6 units for credit
+   (6 decimal places, matching `NUMERIC(8,6)`), or the conversion's exact cent
+   total for revenue.
+2. Floor every share.
+3. Hand the leftover units out one at a time to the largest truncated
+   remainders, **ties broken by touchpoint id**.
+
+Consequences, all test-enforced:
+
+- Credits sum to exactly `Decimal("1.000000")`. Not 0.999999.
+- Attributed revenue sums to exactly the conversion's revenue to the cent.
+  `Decimal("100.01")` split three ways gives `33.34 + 33.34 + 33.33`, never
+  `100.02` or `99.99`.
+- Results are deterministic: the tie-break on touchpoint id means the same
+  journey always produces the same vector.
+
+There is **no float anywhere in the credit path**, including the timestamp
+arithmetic — `timedelta.total_seconds()` returns a float, so `TimeDecay`
+combines `days`/`seconds`/`microseconds` into a `Decimal` by hand instead.
+
+### Lookback window
+
+A touchpoint joins a conversion's journey when it shares the `user_id`,
+occurred at or before the conversion, and is within `lookback_days` (default
+30) of it. Ordering is `occurred_at` ascending, ties broken by touchpoint id
+so the sequence is total.
+
+On the current dataset 8 of 693 conversions have **no** touchpoint in the
+window. That is a real outcome (untracked/direct), not an error: the journey
+is yielded empty, every model returns `[]`, and the conversion is counted in
+`conversions_with_empty_journey`.
+
+### Performance
+
+`load_journeys` walks conversions in keyset-paginated batches and fetches all
+touchpoints for a batch's users in **one** query, so the cost is 2 queries per
+batch rather than 1 per conversion: **693 journeys in 4 queries**. The query
+count is logged on every pass.
+
+### Verification
+
+`--rebuild` then a second run with no flags: `attribution_results` stayed at
+**8,273 rows**, with `rows_inserted` going 8,273 → **0** and `rows_updated`
+0 → **8,273**, and zero duplicate `(conversion_id, touchpoint_id, model_name)`
+keys.
+
+Revenue reconciles to the cent: total conversion revenue \$126,197.69 =
+\$124,804.39 attributed (identical under all five models) + \$1,393.30 from
+the 8 empty-journey conversions.
+
+### Notes / gotchas for future sessions
+
+1. **Only non-zero credits are written.** A zero-credit row would assert "this
+   touchpoint got nothing", which its absence already says, and it would make
+   `touchpoint_count` in `channel_performance` mean something different for
+   `last_touch` (all touchpoints in every journey) than for `linear` (the
+   credited ones). A row in `attribution_results` means credit was assigned.
+   The models themselves still return a full vector including zeros — that is
+   the mathematical object, and the tests check it.
+
+2. **Every model attributes an identical total.** That is the strongest
+   invariant in the phase: if two models disagree on the *total*, there is a
+   bug in the apportionment, not a difference of opinion. Only the
+   distribution across channels should differ.
+
+3. **`rebuild=True` is required when a model's definition or the lookback
+   changes.** An upsert can add and update rows but cannot delete rows that
+   should no longer exist — e.g. shrinking the lookback orphans credits for
+   touchpoints that have dropped out of the window. `--rebuild` deletes only
+   the selected models' rows, so a single-model rebuild leaves the others
+   intact (test-enforced).
+
+4. **A touchpoint can belong to several journeys.** A repeat purchaser's early
+   touches sit inside the lookback window of more than one conversion, so
+   `rows_written` (rows upserted) and `touchpoints_credited` (distinct
+   touchpoint ids) are genuinely different numbers. They happen to be equal on
+   the current dataset because repeat purchases are rare here.
+
+5. **ROAS is `None`, never 0 or an error, when spend is zero.** Organic has no
+   spend by definition. `channel_performance` also includes channels that cost
+   money but earned no credit — those are exactly the ones worth questioning.
+
+6. **`email` shows a ~197x ROAS. That is an artifact, not a finding.** Phase 3
+   models email cost as near-zero (per-send, effectively rounding error), so
+   its denominator is tiny. Do not present it as a real result in the
+   dashboard without a caveat.
+
+7. **Spend is joined to channels separately from attribution.** Joining
+   `ad_spend` into the attribution aggregate would multiply spend by the number
+   of attribution rows per campaign. `_spend_by_channel` is a second query,
+   merged in Python, for exactly that reason.
+
+8. **`date_trunc` granularity is whitelisted.** It takes a SQL literal, so
+   `timeseries` validates against `GRANULARITIES` rather than interpolating
+   the caller's string.
+
+9. **Date filters use explicit UTC datetime bounds**, not `CAST(... AS date)`,
+   so results do not depend on the database session's timezone.
+
+10. **`pytest` truncates the data tables** (the `db` fixtures in
+    `test_pipeline.py` and `test_attribution.py`). Re-run the Phase 4 pipeline
+    CLI before any attribution demo, or the engine will correctly report zero
+    journeys. Order for a full demo: pytest → `app.pipeline.cli --reset
+    --replay` → `app.attribution.cli --rebuild`.
+
+11. **`credit` is `NUMERIC(8,6)`**, which holds `[0, 99.999999]` — fine for a
+    fraction in `[0, 1]` at exactly 6 decimal places. If a future model ever
+    emits credits above 1 (e.g. an uplift model), the column needs widening.
