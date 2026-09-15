@@ -23,7 +23,7 @@ export default function PipelineHealth({ state, onRetry }) {
   return (
     <Card
       title="Pipeline health"
-      subtitle="Ingestion is built to expect broken upstream data. Quarantined rows are records the validator caught — not failures."
+      subtitle="Ingestion expects broken upstream data. Quarantined rows are records the validator caught, not failures."
     >
       {error && !data ? (
         <InlineError error={error} onRetry={onRetry} />

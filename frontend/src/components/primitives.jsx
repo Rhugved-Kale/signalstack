@@ -1,21 +1,25 @@
 /** Small shared building blocks: cards, skeletons, states, badges. */
 
+/**
+ * A region of the page, separated by a hairline rule rather than drawn as a
+ * bordered card with a shadow. Same API as before so callers are unchanged.
+ */
 export function Card({ title, subtitle, action, children, className = '' }) {
   return (
-    <section className={`card ${className}`.trim()}>
+    <section className={`panel ${className}`.trim()}>
       {(title || action) && (
         <header
           style={{
             display: 'flex',
             alignItems: 'flex-start',
             justifyContent: 'space-between',
-            gap: 12,
-            marginBottom: 12,
+            gap: 'var(--s3)',
+            marginBottom: 'var(--s4)',
           }}
         >
           <div>
-            {title && <h3 className="card-title">{title}</h3>}
-            {subtitle && <p className="card-subtitle">{subtitle}</p>}
+            {title && <h3 className="panel-title">{title}</h3>}
+            {subtitle && <p className="panel-subtitle">{subtitle}</p>}
           </div>
           {action}
         </header>

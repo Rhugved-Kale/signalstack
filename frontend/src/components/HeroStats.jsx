@@ -1,12 +1,12 @@
-import { count, money, moneyWhole, roas } from '../format';
+import { count, moneyWhole, roas } from '../format';
 import { modelLabel } from '../theme';
 import { EmptyState, InlineError, Skeleton } from './primitives';
 
-function Stat({ label, value, hint, small = false }) {
+function Stat({ label, value, hint, compact = false }) {
   return (
     <div className="stat">
       <div className="stat-label">{label}</div>
-      <div className={`stat-value${small ? ' is-small' : ''}`}>{value}</div>
+      <div className={`stat-value${compact ? ' is-compact' : ''}`}>{value}</div>
       {hint && <div className="stat-hint">{hint}</div>}
     </div>
   );
@@ -14,11 +14,11 @@ function Stat({ label, value, hint, small = false }) {
 
 function StatSkeletons() {
   return (
-    <div className="stat-grid">
+    <div className="stat-strip">
       {Array.from({ length: 5 }, (_, index) => (
         <div className="stat" key={index}>
-          <Skeleton height={10} width="60%" />
-          <Skeleton height={26} width="80%" style={{ marginTop: 8 }} />
+          <Skeleton height={9} width="64%" />
+          <Skeleton height={26} width="82%" style={{ marginTop: 6 }} />
         </div>
       ))}
     </div>
@@ -72,19 +72,19 @@ function DisagreementSpotlight({ disagreement }) {
 
       {hasBothSides && (
         <div className="spotlight-figures">
-          <div>
+          <div className="spotlight-figure">
             <div className="spotlight-figure-label">
               {modelLabel(generousModel)}
             </div>
             <div className="spotlight-figure-value">{moneyWhole(high)}</div>
           </div>
-          <div>
+          <div className="spotlight-figure">
             <div className="spotlight-figure-label">
               {modelLabel(stingyModel)}
             </div>
             <div className="spotlight-figure-value">{moneyWhole(low)}</div>
           </div>
-          <div>
+          <div className="spotlight-figure">
             <div className="spotlight-figure-label">Contested</div>
             <div className="spotlight-figure-value is-swing">
               {moneyWhole(swing)}
@@ -122,20 +122,25 @@ export default function HeroStats({ state, disagreement, onRetry }) {
         Headline figures
       </h2>
 
-      <div className={`hero-grid${isRefreshing ? ' is-refreshing' : ''}`}>
+      <div className={`hero${isRefreshing ? ' is-refreshing' : ''}`}>
         <div>
           {isLoading ? (
             <StatSkeletons />
           ) : !summary ? (
             <EmptyState>No summary available.</EmptyState>
           ) : (
-            <div className="stat-grid">
+            <div className="stat-strip">
               <Stat
                 label="Attributed revenue"
-                value={money(summary.total_attributed_revenue)}
-                hint="identical under every model"
+                value={moneyWhole(summary.total_attributed_revenue)}
+                hint="same under every model"
+                compact
               />
-              <Stat label="Ad spend" value={money(summary.total_spend)} />
+              <Stat
+                label="Ad spend"
+                value={moneyWhole(summary.total_spend)}
+                compact
+              />
               <Stat
                 label="Blended ROAS"
                 value={roas(summary.blended_roas)}
@@ -144,27 +149,27 @@ export default function HeroStats({ state, disagreement, onRetry }) {
               <Stat
                 label="Conversions"
                 value={count(summary.conversion_count)}
-                small
               />
               <Stat
                 label="Touchpoints"
                 value={count(summary.touchpoint_count)}
-                hint={`across ${count(summary.channel_count)} channels`}
-                small
+                hint={`${count(summary.channel_count)} channels`}
               />
             </div>
           )}
         </div>
 
-        {isLoading ? (
-          <div className="spotlight">
-            <Skeleton height={11} width="38%" />
-            <Skeleton height={62} style={{ marginTop: 14 }} />
-            <Skeleton height={40} width="72%" style={{ marginTop: 14 }} />
-          </div>
-        ) : (
-          <DisagreementSpotlight disagreement={disagreement} />
-        )}
+        <div className="hero-spotlight">
+          {isLoading ? (
+            <div className="spotlight">
+              <Skeleton height={10} width="34%" />
+              <Skeleton height={64} style={{ marginTop: 16 }} />
+              <Skeleton height={44} width="76%" style={{ marginTop: 20 }} />
+            </div>
+          ) : (
+            <DisagreementSpotlight disagreement={disagreement} />
+          )}
+        </div>
       </div>
     </section>
   );

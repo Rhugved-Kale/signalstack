@@ -1468,3 +1468,83 @@ All five models total exactly $48,405.73; total contested revenue $60,998.11.
 4. **Live figures in the README will drift** if anyone presses **Run pipeline**,
    which regenerates with a random seed. The table is labelled as a snapshot
    from live data; re-read `/api/model-comparison` before quoting it.
+
+## Phase 10.5 — Fluid figures (redesign branch)
+
+Date: 2026-09-15
+
+On the `redesign` branch. Frontend only; no API call, data shape or component
+behaviour changed.
+
+### Figure overflow, fixed at the cause
+
+Large currency figures overflowed their container: `$55,195.02` visibly spilled
+its stat card on the deployed `main` design, and during the redesign the same
+cause produced `$12…` truncation, which was worked around by widening the strip
+rather than fixed. The cause is that **figure font size was static while the
+rendered width of a figure depends on the data** — and since Phase 8 the Run
+pipeline button uses a random seed, so a larger world produces longer numbers
+at any time. `$100,000,000` is roughly 2.4x the width of `$55,195.02`.
+
+What changed:
+
+- **Fluid type.** `--fs-hero` (a static 30px) is gone, replaced by two clamped
+  tokens: `--fs-figure: clamp(19px, 0.55rem + 1.25vw, 29px)` and
+  `--fs-figure-sm: clamp(17px, 0.5rem + 1.05vw, 24px)`. Currency uses the
+  smaller ramp because it is the longest figure type. The minima were chosen to
+  stay legible at 380px (17-19px).
+- **Static overrides removed.** The `--fs-hero: 26px` override at 720px and the
+  `22px`/`20px` figure overrides at 440px all fought the clamp and are deleted;
+  one fluid curve now covers every width.
+- **No clipping is possible on a figure.** `white-space: nowrap` is kept (it
+  stops a number breaking mid-figure) but there is deliberately no
+  `overflow: hidden` and no `text-overflow: ellipsis` on any figure, and the
+  text itself can shrink, which is what makes nowrap safe here.
+- **The callout figures size to their content.** `.spotlight-figures` was a
+  grid of `minmax(0, 200px)` tracks — a fixed cap that a 7-figure amount
+  exceeds. It is now a wrapping flex row, so each figure takes the width it
+  needs and the row wraps rather than overflowing.
+- **Tabular lining numerals preserved** throughout, so figures still do not
+  jitter when the model changes.
+
+### Verified against stress data, not today's data
+
+A temporary `?stress=1` override rendered `$9,999,999.99` revenue, a 5-digit
+ROAS (`12,345.6×`), 7-digit counts and a long channel name
+(`programmatic_video_retargeting`) in the callout. Measured at three widths
+with a `Range` over each figure's text — **the inked width, not the box width**:
+
+| Viewport | Strip columns | Min headroom | Overflow | Wrap | Page scroll |
+| --- | --- | --- | --- | --- | --- |
+| 1440px | 5 on one row | 33.7% | none | none | none |
+| 1024px | 5 on one row | 35.6% | none | none | none |
+| 380px | 2 + full-width 5th | 36.5% | none | none | none |
+
+With real data the headroom is 50-75%. The stress override was removed before
+committing.
+
+### Notes / gotchas for future sessions
+
+1. **`scrollWidth` does not measure text width on a block element.** When the
+   text fits, `scrollWidth === clientWidth === the box width`, so an overflow
+   audit built on it reports a bogus "0.4px of headroom" and tells you nothing.
+   This briefly caused a real over-correction here: the clamp maxima were cut
+   from 30/26 to 26/22 on the strength of a meaningless measurement, then
+   restored to 29/24 once the figures were measured properly with
+   `Range.getBoundingClientRect()`. Measure the range, not the box.
+
+2. **The recharts `LabelList` issue is a KNOWN, PRE-EXISTING bug on `main`, and
+   is deliberately not fixed.** Direct bar value labels (`$42.6k` at each bar
+   end in Channel performance) render *nothing*: recharts 3 drops a
+   `<LabelList>` — and a `<Bar label=...>` — when the same `<Bar>` has
+   `<Cell>` children, which it does, because `<Cell>` is how each channel gets
+   its own colour. Confirmed pre-existing by checking out `main`'s component
+   and observing zero label text nodes there too. Two fixes were attempted (an
+   explicit label renderer, then a custom `shape` to free the label slot);
+   neither made recharts emit them, so the change was reverted to keep the diff
+   minimal rather than destabilise a working chart over a library bug.
+   **Mitigation: the table view directly below every chart carries the exact
+   values**, and the redesign palette clears 3:1 contrast on all six channels,
+   so the data-viz relief rule that would *require* direct labels does not
+   apply. Revisit if recharts fixes it or if `<Cell>` is replaced by a `shape`
+   that recharts treats differently.
