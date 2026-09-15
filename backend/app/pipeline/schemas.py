@@ -24,6 +24,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -33,6 +34,19 @@ UTC = dt.timezone.utc
 # Money is stored as NUMERIC(12,2); quantize on the way in so the database
 # never has to round silently behind us.
 MONEY_EXPONENT = Decimal("0.01")
+
+# --- Timestamp plausibility -------------------------------------------------
+# A timestamp can be perfectly well-formed and still be nonsense for this
+# dataset. Phase 3's `timestamp_unix_int` corruptor replaces a timestamp with a
+# random epoch integer, which parses cleanly as a real instant years away from
+# anything we ingest — shape-valid, semantically absurd. Parsing alone cannot
+# tell the difference, so these bounds do.
+#
+# They are deliberately generous: the job here is to catch corruption, not to
+# enforce the dataset's exact window. Backfills of genuinely old data are a
+# legitimate use case, and a clock a little ahead of ours is normal.
+MAX_TIMESTAMP_AGE = dt.timedelta(days=730)  # ~2 years before ingestion
+MAX_TIMESTAMP_SKEW = dt.timedelta(days=1)  # tolerated clock skew into the future
 
 # Currencies this pipeline is prepared to handle. This is a *semantic* check,
 # not a shape check: "XYZ" is a perfectly well-formed three-letter code and is
@@ -196,10 +210,71 @@ def _parse_currency(value: Any) -> str:
     return code
 
 
+def _reference_now(info: ValidationInfo | None) -> dt.datetime:
+    """The instant to judge plausibility against.
+
+    Injectable via validation context (`model_validate(raw, context={"now":
+    ...})`) so tests do not depend on the wall clock; falls back to the real
+    clock in production.
+    """
+    if info is not None and info.context:
+        candidate = info.context.get("now")
+        if candidate is not None:
+            if not isinstance(candidate, dt.datetime):
+                raise TypeError("context['now'] must be a datetime")
+            return candidate if candidate.tzinfo else candidate.replace(tzinfo=UTC)
+    return dt.datetime.now(UTC)
+
+
+def _require_plausible(moment: dt.datetime, original: Any, now: dt.datetime) -> None:
+    """Reject a parseable-but-absurd instant.
+
+    This is a *semantic* check, not a shape check. The value already parsed
+    successfully; the question here is whether it could plausibly belong to
+    data we are ingesting right now.
+    """
+    if moment < now - MAX_TIMESTAMP_AGE:
+        raise ValueError(
+            f"{original!r} is outside the plausible window "
+            f"(more than {MAX_TIMESTAMP_AGE.days // 365} years in the past)"
+        )
+    if moment > now + MAX_TIMESTAMP_SKEW:
+        raise ValueError(
+            f"{original!r} is outside the plausible window "
+            f"(more than {MAX_TIMESTAMP_SKEW.days} day in the future)"
+        )
+
+
+def _validate_timestamp(value: Any, info: ValidationInfo) -> dt.datetime:
+    """Parse, then sanity-check against the reference clock."""
+    moment = _parse_timestamp(value)
+    _require_plausible(moment, value, _reference_now(info))
+    return moment
+
+
+def _validate_date(value: Any, info: ValidationInfo) -> dt.date:
+    """Same two steps for a calendar date, compared day-to-day."""
+    day = _parse_date(value)
+    now = _reference_now(info)
+    if day < (now - MAX_TIMESTAMP_AGE).date():
+        raise ValueError(
+            f"{value!r} is outside the plausible window "
+            f"(more than {MAX_TIMESTAMP_AGE.days // 365} years in the past)"
+        )
+    if day > (now + MAX_TIMESTAMP_SKEW).date():
+        raise ValueError(
+            f"{value!r} is outside the plausible window "
+            f"(more than {MAX_TIMESTAMP_SKEW.days} day in the future)"
+        )
+    return day
+
+
 NonEmptyStr = Annotated[str, BeforeValidator(_require_non_empty_str)]
 OptionalStr = Annotated[str | None, BeforeValidator(_optional_non_empty_str)]
-Timestamp = Annotated[dt.datetime, BeforeValidator(_parse_timestamp)]
-CalendarDate = Annotated[dt.date, BeforeValidator(_parse_date)]
+# These apply the plausibility window; `_parse_timestamp` / `_parse_date` stay
+# pure shape parsers so the two concerns remain separable.
+Timestamp = Annotated[dt.datetime, BeforeValidator(_validate_timestamp)]
+CalendarDate = Annotated[dt.date, BeforeValidator(_validate_date)]
 Money = Annotated[Decimal, BeforeValidator(_parse_money)]
 CurrencyCode = Annotated[str, BeforeValidator(_parse_currency)]
 

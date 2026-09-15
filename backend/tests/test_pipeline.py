@@ -42,6 +42,8 @@ from app.pipeline.loaders import upsert_campaigns, upsert_touchpoints
 from app.pipeline.replay import replay_quarantine
 from app.pipeline.runner import run_ingestion
 from app.pipeline.schemas import (
+    MAX_TIMESTAMP_AGE,
+    MAX_TIMESTAMP_SKEW,
     SUPPORTED_CURRENCIES,
     AdSpendIn,
     CampaignIn,
@@ -887,3 +889,186 @@ def test_replay_with_fetch_parents_disabled_recovers_nothing(db):
     assert result["totals"]["recovered"] == 0
     assert result["totals"]["still_quarantined"] == before
     assert db.scalar(select(func.count()).select_from(Campaign)) == 0
+
+
+# ---------------------------------------------------------------------------
+# Timestamp plausibility (Phase 6.5)
+# ---------------------------------------------------------------------------
+
+# A fixed reference instant, injected via validation context, so none of these
+# tests depend on the wall clock.
+PLAUSIBILITY_REF = dt.datetime(2026, 9, 15, 12, 0, 0, tzinfo=UTC)
+
+
+def _iso(moment: dt.datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _validate_at(model, payload, *, now=PLAUSIBILITY_REF):
+    return model.model_validate(payload, context={"now": now})
+
+
+def _conversion_at(moment) -> dict:
+    return {
+        "order_id": "ord_plausible",
+        "customer_id": "usr_plausible",
+        "amount": 49.99,
+        "currency": "USD",
+        "created_at": _iso(moment) if isinstance(moment, dt.datetime) else moment,
+    }
+
+
+def _touchpoint_at(moment) -> dict:
+    return {
+        "event_id": "evt_plausible",
+        "user_id": "usr_plausible",
+        "campaign_id": None,
+        "channel": "organic",
+        "event_type": "visit",
+        "timestamp": _iso(moment) if isinstance(moment, dt.datetime) else moment,
+    }
+
+
+def test_timestamp_three_years_in_the_past_is_rejected():
+    """Shape-valid, semantically absurd for data being ingested now."""
+    moment = PLAUSIBILITY_REF - dt.timedelta(days=365 * 3)
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(ConversionIn, _conversion_at(moment))
+
+    reason = describe_validation_error(excinfo.value)
+    assert "created_at" in reason
+    assert "outside the plausible window" in reason
+    assert "2 years in the past" in reason
+    # The reason names the offending value.
+    assert _iso(moment) in reason
+
+
+def test_timestamp_two_days_in_the_future_is_rejected():
+    moment = PLAUSIBILITY_REF + dt.timedelta(days=2)
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(TouchpointIn, _touchpoint_at(moment))
+
+    reason = describe_validation_error(excinfo.value)
+    assert "timestamp" in reason
+    assert "outside the plausible window" in reason
+    assert "1 day in the future" in reason
+
+
+def test_timestamp_one_hour_in_the_future_is_accepted():
+    """Clock skew between systems is normal, not corruption."""
+    moment = PLAUSIBILITY_REF + dt.timedelta(hours=1)
+    record = _validate_at(TouchpointIn, _touchpoint_at(moment))
+    assert record.occurred_at == moment
+
+    # The whole tolerated skew window is fine, right up to the boundary.
+    edge = PLAUSIBILITY_REF + MAX_TIMESTAMP_SKEW
+    assert _validate_at(TouchpointIn, _touchpoint_at(edge)).occurred_at == edge
+
+
+def test_timestamp_one_year_in_the_past_is_accepted():
+    """Backfilling genuinely old data is a legitimate use case."""
+    moment = PLAUSIBILITY_REF - dt.timedelta(days=365)
+    record = _validate_at(ConversionIn, _conversion_at(moment))
+    assert record.occurred_at == moment
+
+    edge = PLAUSIBILITY_REF - MAX_TIMESTAMP_AGE
+    assert _validate_at(ConversionIn, _conversion_at(edge)).occurred_at == edge
+
+
+def test_plausibility_uses_the_injected_reference_not_the_real_clock():
+    """Proves the check is deterministic and clock-independent.
+
+    With the reference moved back to 2020, a timestamp that is perfectly
+    plausible by the wall clock becomes "more than 1 day in the future".
+    """
+    wall_clock_fine = dt.datetime(2026, 9, 1, tzinfo=UTC)
+    past_reference = dt.datetime(2020, 1, 1, tzinfo=UTC)
+
+    # Accepted against a 2026 reference...
+    assert _validate_at(
+        ConversionIn, _conversion_at(wall_clock_fine), now=PLAUSIBILITY_REF
+    ).occurred_at == wall_clock_fine
+
+    # ...and rejected against a 2020 one, from the identical payload.
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(ConversionIn, _conversion_at(wall_clock_fine), now=past_reference)
+    assert "1 day in the future" in describe_validation_error(excinfo.value)
+
+    # And the mirror image: a 2020 timestamp is fine against a 2020 reference
+    # but not against a 2026 one.
+    old_moment = dt.datetime(2020, 1, 1, tzinfo=UTC)
+    assert _validate_at(
+        ConversionIn, _conversion_at(old_moment), now=past_reference
+    ).occurred_at == old_moment
+    with pytest.raises(ValidationError):
+        _validate_at(ConversionIn, _conversion_at(old_moment), now=PLAUSIBILITY_REF)
+
+
+def test_epoch_integer_corruption_is_now_caught():
+    """The bug that started Phase 6.5.
+
+    `timestamp_unix_int` corruption parses cleanly as a real instant, so only
+    a plausibility check can reject it.
+    """
+    # 1_600_000_000 -> 2020-09-13, six years before the reference.
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(ConversionIn, _conversion_at(1_600_000_000))
+    assert "outside the plausible window" in describe_validation_error(excinfo.value)
+
+    # 1_800_000_000 -> 2027-01-15, four months after it.
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(ConversionIn, _conversion_at(1_800_000_000))
+    assert "in the future" in describe_validation_error(excinfo.value)
+
+    # An epoch inside the window is still accepted — the check is a
+    # plausibility guard, not a dataset-window check.
+    inside = int((PLAUSIBILITY_REF - dt.timedelta(days=10)).timestamp())
+    assert _validate_at(ConversionIn, _conversion_at(inside)).occurred_at.date() == (
+        PLAUSIBILITY_REF - dt.timedelta(days=10)
+    ).date()
+
+
+def test_ad_spend_date_is_also_checked():
+    def spend_on(day) -> dict:
+        return {
+            "campaign_id": "cmp_plausible",
+            "date": day,
+            "spend_usd": 12.34,
+            "impressions": 100,
+            "clicks": 4,
+        }
+
+    # Three years back: rejected.
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(AdSpendIn, spend_on("2023-09-15"))
+    reason = describe_validation_error(excinfo.value)
+    assert "date" in reason
+    assert "outside the plausible window" in reason
+
+    # Two days ahead: rejected.
+    with pytest.raises(ValidationError):
+        _validate_at(AdSpendIn, spend_on("2026-09-17"))
+
+    # Tomorrow and inside the window: accepted.
+    assert _validate_at(AdSpendIn, spend_on("2026-09-16")).date == dt.date(2026, 9, 16)
+    assert _validate_at(AdSpendIn, spend_on("2026-08-01")).date == dt.date(2026, 8, 1)
+
+
+def test_plausibility_falls_back_to_the_wall_clock_without_context():
+    """Production passes no context; the real clock is the reference then."""
+    now = dt.datetime.now(UTC)
+    assert ConversionIn.model_validate(
+        _conversion_at(now - dt.timedelta(days=1))
+    ).occurred_at is not None
+
+    with pytest.raises(ValidationError):
+        ConversionIn.model_validate(_conversion_at(now - dt.timedelta(days=365 * 4)))
+
+
+def test_shape_errors_still_take_precedence_over_plausibility():
+    """An unparseable value is a shape error, not a plausibility one."""
+    with pytest.raises(ValidationError) as excinfo:
+        _validate_at(ConversionIn, _conversion_at("not-a-date"))
+    reason = describe_validation_error(excinfo.value)
+    assert "unparseable timestamp" in reason
+    assert "plausible window" not in reason

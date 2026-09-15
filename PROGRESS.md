@@ -959,3 +959,119 @@ and reproduced the CLI's numbers exactly (9,862 received → 521 replayed →
 
 9. **Job state is lost on restart.** Acceptable for a demo control. If it ever
    needs to survive a deploy, it belongs in a table, not a dict.
+
+## Phase 6.5 — Timestamp plausibility
+
+Date: 2026-09-14
+
+Scope: one semantic check in `backend/app/pipeline/schemas.py`, plus tests.
+No new endpoints, no frontend.
+
+### Shape-validity is not semantic-validity
+
+Phase 4's timestamp parser asked one question: *can this be parsed?* Phase 3's
+`timestamp_unix_int` corruptor replaces a timestamp with
+`randint(1_600_000_000, 1_800_000_000)` — a random epoch integer spanning
+2020-09-13 to 2027-01-15. Every one of those parses perfectly. They are real,
+well-formed instants. They are simply absurd for a dataset covering the last
+60 days.
+
+That is the distinction this phase is about, and it is the same one Phase 4.5
+drew for currencies: `"XYZ"` is a well-formed three-letter code and still not
+money we can attribute. A parser can only reject malformed input; it cannot
+reject well-formed input the system has no meaning for. That needs a second,
+semantic check — and the two must stay separate, because a value can fail one
+without the other.
+
+`_parse_timestamp` / `_parse_date` remain pure shape parsers. New wrappers
+`_validate_timestamp` / `_validate_date` run the shape parse first, then apply
+the plausibility window, so an unparseable value still reports
+`unparseable timestamp` rather than a confusing plausibility error
+(test-enforced).
+
+### The window
+
+```python
+MAX_TIMESTAMP_AGE  = dt.timedelta(days=730)  # ~2 years before ingestion
+MAX_TIMESTAMP_SKEW = dt.timedelta(days=1)    # tolerated clock skew ahead
+```
+
+Deliberately generous. The job is to catch corruption, not to enforce the
+dataset's exact window: backfilling genuinely old data is legitimate, and a
+source system whose clock runs an hour ahead of ours is normal — treating that
+as corruption would quarantine good data. Rejections name the value and the
+reason:
+
+    created_at: 1676632583 is outside the plausible window (more than 2 years in the past)
+    timestamp: '2026-09-17T12:00:00Z' is outside the plausible window (more than 1 day in the future)
+
+Applies to `TouchpointIn.occurred_at`, `ConversionIn.occurred_at` and
+`AdSpendIn.date`.
+
+The reference "now" is injectable through Pydantic's validation context —
+`model_validate(raw, context={"now": ...})` — so tests are deterministic
+instead of depending on the wall clock. Production passes no context and gets
+the real clock.
+
+### It was caught by a downstream view, not by the validator
+
+Worth recording how this surfaced. The validator was happy. The pipeline
+reported no errors. Every test passed. What exposed it was building
+`GET /api/summary` in Phase 6 and noticing that `date_range` read
+**2022-12-11 → 2026-09-14** for a dataset that covers 60 days.
+
+Nothing upstream was in a position to notice: each layer did exactly its job
+on each record in isolation, and the anomaly only existed in the *aggregate*.
+A min/max over a column turned out to be a better corruption detector than the
+per-record validator, because it asks a question no single record can answer.
+The lesson is to build the aggregate view early — it audits the layers beneath
+it for free.
+
+### Results
+
+Re-running `--reset --users 3000 --replay` then `--rebuild`:
+
+| | before | after |
+| --- | --- | --- |
+| `/api/summary` `date_range` | 2022-12-11 → 2026-09-14 | **2026-07-20 → 2026-09-14** |
+| conversions outside the 60-day window | 2 | **0** |
+| touchpoints outside the 60-day window | 108 | 27 |
+| conversions / touchpoints | 693 / 7,879 | 691 / 7,798 |
+| quarantined records | 403 | 496 |
+
+93 records were newly quarantined by the check: 84 touchpoints, 7 ad_spend, 2
+conversions. Every model still attributes an identical total
+(\$124,804.39, credit exactly 685.000000 each), and revenue still reconciles
+to the cent: \$125,958.67 total = \$124,804.39 attributed + \$1,154.28 across
+6 empty-journey conversions.
+
+### Notes / gotchas for future sessions
+
+1. **27 touchpoints are still outside the 60-day world window (2024-09-29 to
+   2026-06-16), and that is expected.** A 2-year plausibility window cannot
+   catch a corrupted epoch that happens to land inside 2 years — roughly a
+   third of the corruptor's `1.6e9 … 1.8e9` range falls within it. The
+   conversions were all caught because both bad ones happened to land in
+   2022-23. If the remaining 27 ever matter, the fix is a *different* check —
+   validating against the ingestion run's own world window rather than a
+   generic horizon — which is a narrower, dataset-aware rule and a deliberate
+   non-goal here. `ad_spend.date` likewise still has one row at 2025-08-07.
+
+2. **A Pydantic `BeforeValidator` only receives `ValidationInfo` if the
+   function takes exactly two parameters with no default.** Writing
+   `def f(value, info=None)` silently makes it a one-argument validator and
+   `info.context` is never delivered — the injected `now` would be ignored and
+   the tests would pass against the wall clock by accident. Verified
+   empirically before relying on it.
+
+3. **The two rejected conversions were exactly the ones with empty journeys**,
+   which is why total attributed revenue did not change at all. Their
+   timestamps were years away from any touchpoint, so nothing fell inside
+   their 30-day lookback and they contributed nothing to attribution.
+   Consistent, and a useful sanity signal.
+
+4. **The runner does not pin a single reference "now" per run.** Each record is
+   judged against the clock at the moment it is validated, so a very long
+   ingestion could in principle apply a drifting boundary. Irrelevant at
+   current runtimes (seconds), but if runs ever take hours, pass
+   `context={"now": run_started_at}` from `runner.py` for a stable boundary.
