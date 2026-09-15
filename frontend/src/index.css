@@ -1122,3 +1122,84 @@ table.data tr.is-highlight td:first-child {
     font-size: 23px;
   }
 }
+
+/* --- run launcher: seed input beside the button -------------------------- */
+
+.run-launcher {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.seed-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.seed-label {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.seed-input {
+  width: 82px;
+  min-height: 40px;
+  padding: 9px 10px;
+  font: inherit;
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+
+.seed-input:disabled {
+  opacity: 0.6;
+}
+
+.run-panel-seed {
+  margin-left: 8px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- cold-start progress ------------------------------------------------- */
+
+.wake-progress {
+  margin: 20px auto 10px;
+  max-width: 320px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.wake-progress-bar {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 260ms linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wake-progress-bar {
+    transition: none;
+  }
+}
+
+@media (max-width: 420px) {
+  .run-launcher {
+    flex-wrap: wrap;
+  }
+  .seed-input {
+    width: 74px;
+  }
+}

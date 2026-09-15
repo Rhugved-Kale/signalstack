@@ -4,7 +4,23 @@ import { ApiError, getDemoStatus, startDemoReset } from '../api';
 import { count } from '../format';
 
 const POLL_INTERVAL_MS = 1000;
-const DEMO_PAYLOAD = { seed: 42, users: 3000, failure_profile: 'normal' };
+const DEMO_USERS = 3000;
+const DEMO_FAILURE_PROFILE = 'normal';
+const SEED_MIN = 1;
+const SEED_MAX = 99999;
+
+/**
+ * A random seed by default.
+ *
+ * Seed 42 regenerates byte-identical data, so a live demo of "Run pipeline"
+ * produced an identical dashboard and looked broken. A random seed makes the
+ * numbers visibly move; the input below still allows a deliberate choice, and
+ * the seed actually used is reported after the run so a result can be
+ * reproduced.
+ */
+function randomSeed() {
+  return Math.floor(Math.random() * (SEED_MAX - SEED_MIN + 1)) + SEED_MIN;
+}
 
 const STAGE_COPY = {
   reset: 'Truncate tables',
@@ -39,6 +55,7 @@ export default function RunPipeline({ onComplete }) {
   const [phase, setPhase] = useState('idle'); // idle | confirming | running | done | error
   const [job, setJob] = useState(null);
   const [message, setMessage] = useState(null);
+  const [seed, setSeed] = useState(() => randomSeed());
   const timerRef = useRef(null);
   const mountedRef = useRef(true);
 
@@ -64,7 +81,16 @@ export default function RunPipeline({ onComplete }) {
 
         if (status.status === 'success') {
           setPhase('done');
-          setMessage('Pipeline rebuilt — refreshing every section.');
+          const used = status.params ?? {};
+          const capped = used.users_capped
+            ? ` (capped from ${count(used.users_requested)} to fit the host)`
+            : '';
+          setMessage(
+            `Rebuilt with seed ${used.seed} and ${count(used.users)} users${capped}` +
+              ' — refreshing every section.',
+          );
+          // Offer a fresh seed for the next run.
+          setSeed(randomSeed());
           onComplete?.();
         } else {
           setPhase('error');
@@ -87,8 +113,17 @@ export default function RunPipeline({ onComplete }) {
     setPhase('running');
     setMessage(null);
     setJob(null);
+    const parsed = Number.parseInt(String(seed), 10);
+    const effectiveSeed = Number.isFinite(parsed)
+      ? Math.min(Math.max(parsed, SEED_MIN), SEED_MAX)
+      : randomSeed();
+
     try {
-      const accepted = await startDemoReset(DEMO_PAYLOAD);
+      const accepted = await startDemoReset({
+        seed: effectiveSeed,
+        users: DEMO_USERS,
+        failure_profile: DEMO_FAILURE_PROFILE,
+      });
       if (!mountedRef.current) return;
       setJob(accepted);
       timerRef.current = setTimeout(
@@ -113,15 +148,34 @@ export default function RunPipeline({ onComplete }) {
 
   return (
     <div>
-      <button
-        type="button"
-        className="btn btn-primary"
-        onClick={() => setPhase(isRunning ? 'running' : 'confirming')}
-        disabled={isRunning || phase === 'confirming'}
-        aria-describedby={phase === 'confirming' ? 'run-confirm' : undefined}
-      >
-        {isRunning ? 'Running pipeline…' : 'Run pipeline'}
-      </button>
+      <div className="run-launcher">
+        <div className="seed-field">
+          <label className="seed-label" htmlFor="demo-seed">
+            Seed
+          </label>
+          <input
+            id="demo-seed"
+            className="seed-input"
+            type="number"
+            min={SEED_MIN}
+            max={SEED_MAX}
+            step={1}
+            inputMode="numeric"
+            value={seed}
+            disabled={isRunning}
+            onChange={(event) => setSeed(event.target.value)}
+          />
+        </div>
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={() => setPhase(isRunning ? 'running' : 'confirming')}
+          disabled={isRunning || phase === 'confirming'}
+          aria-describedby={phase === 'confirming' ? 'run-confirm' : undefined}
+        >
+          {isRunning ? 'Running pipeline…' : 'Run pipeline'}
+        </button>
+      </div>
 
       {phase === 'confirming' && (
         <div className="run-panel" id="run-confirm" role="alertdialog" aria-labelledby="run-confirm-title">
@@ -129,9 +183,10 @@ export default function RunPipeline({ onComplete }) {
             Regenerate all data?
           </p>
           <p className="run-panel-body">
-            This truncates every table and rebuilds the dataset from scratch:
-            generate → ingest → replay quarantine → re-run attribution. The
-            numbers on this page will change. Takes about 8 seconds.
+            This truncates every table and rebuilds the dataset from scratch
+            with <strong>seed {seed}</strong>: generate → ingest → replay
+            quarantine → re-run attribution. The numbers on this page will
+            change. Takes about 8 seconds.
           </p>
           <div className="run-actions">
             <button type="button" className="btn btn-danger" onClick={start}>
@@ -152,6 +207,11 @@ export default function RunPipeline({ onComplete }) {
         <div className="run-panel">
           <p className="run-panel-title">
             {isRunning ? 'Rebuilding dataset…' : 'Pipeline run'}
+            {job?.params?.seed != null && (
+              <span className="run-panel-seed">
+                seed {job.params.seed} · {count(job.params.users)} users
+              </span>
+            )}
           </p>
           <ul className="stage-list">
             {stages.map((stage) => (

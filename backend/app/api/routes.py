@@ -25,8 +25,10 @@ from app.attribution.analytics import (
     top_journeys,
 )
 from app.attribution.engine import run_attribution
+from app.config import settings
 from app.db.models import Conversion
 from app.db.session import SessionLocal, get_db
+from app.observability import peak_rss_mb
 from app.generator.world import WorldConfig
 from app.pipeline.cli import FAILURE_PROFILES, reset_data
 from app.pipeline.replay import replay_quarantine
@@ -392,11 +394,18 @@ def _run_demo_pipeline(job_id: str, params: dict[str, Any]) -> None:
         )
 
         jobs.registry.finish(job_id)
-        logger.info("demo job %s finished successfully", job_id)
+        logger.info(
+            "demo job %s finished successfully (peak RSS %.1f MB, %s users)",
+            job_id,
+            peak_rss_mb(),
+            params["users"],
+        )
     except Exception as exc:  # noqa: BLE001 - the job records its own failure
         db.rollback()
         message = f"{type(exc).__name__}: {exc}"
-        logger.exception("demo job %s failed", job_id)
+        logger.exception(
+            "demo job %s failed (peak RSS %.1f MB)", job_id, peak_rss_mb()
+        )
         for stage in jobs.STAGES:
             state = jobs.registry.get(job_id)
             if state and state.stage(stage).status == "running":
@@ -422,9 +431,17 @@ def post_demo_reset(
     payload: DemoResetRequest,
     background_tasks: BackgroundTasks,
 ) -> DemoJobResponse:
+    # Clamp rather than reject: a demo button that errors because someone
+    # asked for too much is worse than one that generates a smaller world and
+    # says which size it used. The effective value goes into the job params so
+    # the UI can report "generated 1,500 users".
+    effective_users = min(payload.users, settings.max_demo_users)
     params = {
         "seed": payload.seed,
-        "users": payload.users,
+        "users": effective_users,
+        "users_requested": payload.users,
+        "users_capped": effective_users < payload.users,
+        "max_users": settings.max_demo_users,
         "failure_profile": payload.failure_profile.value,
     }
     try:
@@ -439,6 +456,14 @@ def post_demo_reset(
         ) from exc
 
     background_tasks.add_task(_run_demo_pipeline, job.job_id, params)
+    if params["users_capped"]:
+        logger.info(
+            "demo job %s: users clamped %s -> %s (environment=%s)",
+            job.job_id,
+            payload.users,
+            effective_users,
+            settings.ENVIRONMENT,
+        )
     logger.info("demo job %s accepted with params %s", job.job_id, params)
     return DemoJobResponse(**job.as_dict())
 

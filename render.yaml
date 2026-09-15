@@ -1,0 +1,58 @@
+# Render Blueprint for the SignalStack API.
+#
+# Render reads this when you create a service from the repo ("Blueprint"
+# deploy). The database is NOT described here: Neon is managed separately and
+# its connection string is pasted in as DATABASE_URL.
+#
+# See DEPLOY.md for the full walkthrough.
+
+services:
+  - type: web
+    name: signalstack-api
+    runtime: python
+    # Everything the API needs lives under backend/, so Render treats that as
+    # the project root — requirements.txt, alembic.ini and start.sh are all
+    # resolved relative to it.
+    rootDir: backend
+    plan: free
+    region: oregon
+    branch: master
+
+    buildCommand: pip install -r requirements.txt
+    # start.sh runs `alembic upgrade head` first and exits non-zero if the
+    # migration fails, so a bad schema aborts the deploy instead of booting a
+    # server that 500s on every query.
+    startCommand: ./start.sh
+
+    # Render polls this until it returns 200 before routing traffic. /health
+    # answers immediately — the self-bootstrap runs on a background thread and
+    # reports progress through the same endpoint rather than delaying it.
+    healthCheckPath: /health
+
+    envVars:
+      # Neon connection string. Secret, so it is never committed: sync:false
+      # makes Render prompt for it instead of reading a value from this file.
+      # A bare postgres:// or postgresql:// URL is fine — config.py rewrites
+      # the scheme to postgresql+psycopg:// and preserves ?sslmode=require.
+      - key: DATABASE_URL
+        sync: false
+
+      # Comma-separated browser origins allowed to call the API. Must include
+      # the Vercel URL, which does not exist until the frontend is deployed —
+      # see the chicken-and-egg step in DEPLOY.md.
+      - key: CORS_ORIGINS
+        sync: false
+
+      # Anything other than "local" caps the demo generator at 1500 users to
+      # stay inside the free tier's 512 MB.
+      - key: ENVIRONMENT
+        value: production
+
+      # Match the interpreter the test suite passes against.
+      - key: PYTHON_VERSION
+        value: 3.13.15
+
+      # Set to "false" to leave a fresh database empty instead of
+      # self-populating on first boot.
+      - key: BOOTSTRAP_ON_EMPTY
+        value: "true"

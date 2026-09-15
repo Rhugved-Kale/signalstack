@@ -18,7 +18,10 @@ import {
   buildJourneyList,
 } from './selectors';
 import { useApi } from './hooks/useApi';
+import { useApiWakeup } from './hooks/useApiWakeup';
 import { usePrefersDark } from './hooks/usePrefersDark';
+
+import { ApiUnreachable, ApiWaking } from './components/ApiWakeup';
 
 import ChannelPerformance from './components/ChannelPerformance';
 import HeroStats from './components/HeroStats';
@@ -34,42 +37,6 @@ const JOURNEY_LIMIT = 12;
 // paths sourced from `linear`.
 const JOURNEY_FETCH_LIMIT = 100;
 
-/**
- * Shown when the API cannot be reached at all. One page-level message, not
- * five section-level error boxes.
- */
-function ApiUnreachable({ error, onRetry }) {
-  return (
-    <main className="page">
-      <div className="page-error" role="alert">
-        <h1 className="page-error-title">Waiting for the SignalStack API</h1>
-        <p className="page-error-body">
-          The dashboard could not reach <code>{BASE_URL || '(unset)'}</code>.
-          The API may still be starting up.
-        </p>
-        <p className="page-error-body">
-          Start it with{' '}
-          <code>cd backend &amp;&amp; .venv/bin/uvicorn app.main:app --port 8000</code>{' '}
-          and make sure Postgres is running (<code>docker compose up -d</code>).
-        </p>
-        {error?.detail && (
-          <p className="page-error-body" style={{ fontSize: 12.5 }}>
-            {error.detail}
-          </p>
-        )}
-        <button
-          type="button"
-          className="btn btn-primary"
-          onClick={onRetry}
-          style={{ marginTop: 18 }}
-        >
-          Retry connection
-        </button>
-      </div>
-    </main>
-  );
-}
-
 export default function App() {
   const [model, setModel] = useState(DEFAULT_MODEL);
   // Bumping this re-runs every fetch on the page.
@@ -78,32 +45,42 @@ export default function App() {
   const isDark = usePrefersDark();
   const colors = useMemo(() => palette(isDark), [isDark]);
 
+  // Probe the API before mounting the dashboard. On a free tier the first
+  // request can take a minute; the sections below only fetch once it answers,
+  // so a cold start shows one progress screen instead of six failures.
+  const wakeup = useApiWakeup();
+
   const refreshAll = useCallback(() => {
     setRefreshKey((key) => key + 1);
   }, []);
 
-  // The bootstrap call. If this fails with a network error the whole page
-  // shows one message instead of every section failing separately.
+  // None of these fire until the wake-up probe succeeds, so a sleeping API
+  // produces one progress screen rather than six simultaneous failures.
   const modelsState = useApi(
     (signal) => getModels(signal),
     [refreshKey],
+    { enabled: wakeup.isReady },
   );
 
   const summaryState = useApi(
     (signal) => getSummary(model, signal),
     [model, refreshKey],
+    { enabled: wakeup.isReady },
   );
   const channelsState = useApi(
     (signal) => getChannels(model, signal),
     [model, refreshKey],
+    { enabled: wakeup.isReady },
   );
   const comparisonState = useApi(
     (signal) => getModelComparison(signal),
     [refreshKey],
+    { enabled: wakeup.isReady },
   );
   const journeysState = useApi(
     (signal) => getJourneys(model, JOURNEY_FETCH_LIMIT, signal),
     [model, refreshKey],
+    { enabled: wakeup.isReady },
   );
   // Single-touch models credit one touchpoint, so their rows do not describe
   // the customer's path. `linear` credits every touchpoint, so it does.
@@ -111,11 +88,12 @@ export default function App() {
   const journeyPathsState = useApi(
     (signal) => getJourneys(PATH_SOURCE_MODEL, JOURNEY_FETCH_LIMIT, signal),
     [refreshKey],
-    { enabled: needsPathSource },
+    { enabled: needsPathSource && wakeup.isReady },
   );
   const healthState = useApi(
     (signal) => getPipelineHealth(signal),
     [refreshKey],
+    { enabled: wakeup.isReady },
   );
 
   const models = modelsState.data?.models ?? [];
@@ -136,13 +114,30 @@ export default function App() {
     [model, journeysState.data, journeyPathsState.data],
   );
 
-  // Treat a network-level failure on any core call as "API is down".
+  // Cold start: one progress screen, never six section errors.
+  if (wakeup.phase === 'checking' || wakeup.phase === 'waking') {
+    return (
+      <ApiWaking
+        elapsedMs={wakeup.elapsedMs}
+        timeoutMs={wakeup.timeoutMs}
+        attempts={wakeup.attempts}
+      />
+    );
+  }
+
+  // Only after the full retry window has elapsed is this a real failure.
+  if (wakeup.phase === 'failed') {
+    return <ApiUnreachable error={wakeup.error} onRetry={wakeup.retry} />;
+  }
+
+  // The API answered but a core call still failed at the network layer (it
+  // went back to sleep mid-session, say) — re-probe rather than guess.
   const networkError = [modelsState, summaryState, channelsState].find(
     (state) => state.error?.isNetworkError,
   )?.error;
 
   if (networkError) {
-    return <ApiUnreachable error={networkError} onRetry={refreshAll} />;
+    return <ApiUnreachable error={networkError} onRetry={wakeup.retry} />;
   }
 
   const range = summaryState.data?.date_range;

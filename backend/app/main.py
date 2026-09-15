@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import InterfaceError, OperationalError
 
 from app.api import router as api_router
+from app.bootstrap import maybe_bootstrap_in_background
+from app.bootstrap import status as bootstrap_status
 from app.config import settings
 
 logging.basicConfig(
@@ -46,9 +49,27 @@ Money is `Decimal` end to end internally and is serialised as a JSON number.
 `roas` is `null`, never `0`, for channels with no spend.
 """.strip()
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Start the self-bootstrap without delaying the port binding.
+
+    The work happens on a daemon thread, so uvicorn binds and starts serving
+    immediately and Render's health check passes while data is still being
+    generated. /health reports the progress.
+    """
+    logger.info(
+        "starting SignalStack API (environment=%s, cors=%s)",
+        settings.ENVIRONMENT,
+        ",".join(settings.cors_origins_list) or "(none)",
+    )
+    maybe_bootstrap_in_background()
+    yield
+
+
 app = FastAPI(
     title="SignalStack API",
-    version="0.6.0",
+    version="0.8.0",
+    lifespan=lifespan,
     description=API_DESCRIPTION,
     openapi_tags=[
         {"name": "attribution", "description": "Attribution analytics"},
@@ -139,10 +160,22 @@ app.include_router(api_router)
 
 
 @app.get("/health", tags=["pipeline"], summary="Liveness check")
-def health() -> dict[str, str]:
-    """Unchanged from Phase 1 — deployment health checks depend on this shape."""
-    return {
+def health() -> dict[str, str | None]:
+    """Liveness, plus the self-bootstrap's progress.
+
+    Always returns 200 while the process is up, including when the bootstrap
+    is still running or has failed — this is a *liveness* check, and the
+    platform must not restart a server that is serving fine but happens to
+    have an empty database. The original three keys are unchanged, since
+    deployment probes depend on them.
+    """
+    payload: dict[str, str | None] = {
         "status": "ok",
         "service": "signalstack-api",
         "environment": settings.ENVIRONMENT,
+        "bootstrap": bootstrap_status.state,
     }
+    detail = bootstrap_status.detail
+    if detail:
+        payload["bootstrap_detail"] = detail
+    return payload

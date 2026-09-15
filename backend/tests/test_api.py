@@ -72,13 +72,29 @@ def clean_job_registry():
 # ---------------------------------------------------------------------------
 
 
-def test_health_is_unchanged(client):
+def test_health_keeps_its_original_contract(client):
+    """The three original keys are what deployment probes read.
+
+    Phase 8 added a `bootstrap` key, so this asserts the original contract is
+    intact rather than pinning the whole dict.
+    """
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "ok",
-        "service": "signalstack-api",
-        "environment": "local",
+    payload = response.json()
+
+    assert payload["status"] == "ok"
+    assert payload["service"] == "signalstack-api"
+    assert payload["environment"] == "local"
+
+
+def test_health_reports_bootstrap_state(client):
+    payload = client.get("/health").json()
+    assert payload["bootstrap"] in {
+        "pending",
+        "running",
+        "complete",
+        "skipped",
+        "failed",
     }
 
 
@@ -380,7 +396,12 @@ def test_demo_reset_returns_202_and_reaches_a_terminal_state(client):
     job_id = body["job_id"]
     assert job_id
     assert body["status"] == "running"
-    assert body["params"] == {"seed": 7, "users": 30, "failure_profile": "none"}
+    assert body["params"]["seed"] == 7
+    assert body["params"]["users"] == 30
+    assert body["params"]["failure_profile"] == "none"
+    # Locally the cap is high, so nothing is clamped.
+    assert body["params"]["users_requested"] == 30
+    assert body["params"]["users_capped"] is False
     assert [stage["name"] for stage in body["stages"]] == [
         "reset",
         "ingest",

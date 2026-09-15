@@ -1184,3 +1184,205 @@ value labels. Dark mode uses separately-stepped hues, not dimmed light ones.
 7. **Bundle-level date handling.** All dates are formatted through
    `format.js`; nothing calls `toLocaleString` inline, so the `—` fallback for
    null/NaN is applied in exactly one place per type.
+
+## Phase 8 — Production hardening
+
+Date: 2026-09-14
+
+Config and code only — nothing was deployed, and no accounts exist yet.
+Target: Neon (Postgres), Render free tier (API), Vercel (dashboard).
+
+### Files added
+
+- `render.yaml` — Render blueprint for the web service.
+- `DEPLOY.md` — step-by-step deployment, marked 🖐 browser / ⌨️ terminal / 🤖 automatic.
+- `backend/start.sh` — migrate-then-serve entrypoint (executable).
+- `backend/app/bootstrap.py` — self-populating empty database.
+- `backend/app/observability.py` — `peak_rss_mb()`.
+- `backend/tests/test_deploy_config.py` — 28 tests for the deploy surface.
+- `frontend/vercel.json`, `frontend/.env.example`.
+- `frontend/src/hooks/useApiWakeup.js`, `frontend/src/components/ApiWakeup.jsx`.
+
+### Fix 1 — random seed for the demo button
+
+Seed 42 regenerates byte-identical data, so "Run pipeline" produced an
+identical dashboard and read as broken. The frontend now sends a **random seed
+(1-99999)** by default, shows it in a numeric input beside the button so a
+specific seed can still be chosen, names the seed in the confirmation copy and
+the progress panel, reports it on completion ("Rebuilt with seed 28205 and
+3,000 users"), and rolls a fresh seed for the next run.
+
+Verified in the browser: revenue moved \$57,223 → \$106,201, ROAS 4.2× → 5.0×,
+and the headline swing \$27,754 → \$56,420 across one run. The backend default
+is still 42 — this is a frontend behaviour change only.
+
+### Fix 2 — memory on a 512 MB instance
+
+**Measured, not guessed** (`tracemalloc` per stage, `ru_maxrss` for the
+process):
+
+| Stage | 1500 users | 3000 users |
+| --- | --- | --- |
+| `build_world` | 3.1 MB | 4.9 MB |
+| `run_ingestion` | 14.1 MB | 23.4 MB |
+| `run_attribution` | 8.3 MB | 9.6 MB |
+| **process peak RSS** | **102 MB** | **120 MB** |
+
+Baseline RSS with the app imported but idle is ~71 MB, so the pipeline itself
+costs 30-50 MB. A 3000-user run fits in 512 MB with room to spare; the
+**1500-user cap is a safety margin, not a fix for a measured failure**.
+
+`POST /api/demo/reset` clamps `users` to 1500 whenever `ENVIRONMENT != "local"`
+(20,000 locally). It **clamps rather than rejects** — a demo button that errors
+because someone asked for too much is worse than one that generates a smaller
+world and says so. The job params carry `users` (effective), `users_requested`,
+`users_capped` and `max_users`, and the dashboard appends "(capped from 3,000
+to fit the host)" when it happens.
+
+**Peak row counts held in memory at once** (all bounded by `n_users`, which is
+now capped):
+
+- `runner._ingest_source` accumulates one source's validated records before
+  loading: **~8,200 `TouchpointIn` models + ~8,200 raw dicts at 3000 users**
+  (~4,100 at 1500). This is the single largest accumulation and the reason
+  `run_ingestion` peaks highest. It is O(n_users) but bounded, and measured at
+  23 MB — left as-is rather than restructured, because streaming it would mean
+  re-deriving the `received == ingested + quarantined` identity that Phase 4
+  established and tests.
+- The generator's `FakeAPI._emitted` list keeps a clean copy of every record
+  served (for duplicate replay) — also O(source size), also bounded, and
+  discarded with the API instance at the end of a run.
+- **Already batched, so flat regardless of world size:** `loaders` upsert in
+  chunks of 500, `run_attribution` flushes its write buffer every 1,000 rows,
+  and `load_journeys` walks conversions 500 at a time with one touchpoint query
+  per batch.
+
+Peak RSS is logged at the end of every demo reset and every bootstrap.
+`peak_rss_mb()` handles the `ru_maxrss` unit difference — **bytes on macOS,
+kilobytes on Linux** — which is a classic way to be wrong by 1024x between
+laptop and Render.
+
+### Backend deploy config
+
+**`DATABASE_URL` rewriting.** Neon hands out
+`postgresql://...?sslmode=require`; SQLAlchemy resolves that to psycopg2,
+which this project does not install. `config.py` rewrites `postgres://` and
+`postgresql://` to `postgresql+psycopg://` and leaves the query string
+untouched, so `?sslmode=require` survives and psycopg honours it. Both forms
+are tested, including multi-parameter query strings and a pasted string with
+surrounding whitespace. Unknown schemes pass through unmangled.
+
+**`CORS_ORIGINS`** comes from the environment and splits on commas, tolerating
+spaces and trailing separators. Tested with a real `https://` origin through
+the actual middleware: the allowed origin gets an `access-control-allow-origin`
+header, an unlisted one gets none.
+
+**`start.sh`** runs `alembic upgrade head` and **exits 1 if it fails**, so a
+schema mismatch aborts the deploy instead of booting a server that 500s on
+every query. Binds `0.0.0.0:${PORT:-8000}` with one worker (each worker would
+carry its own pool and its own bootstrap thread on a 512 MB box).
+
+**Self-bootstrap.** On startup, if there are zero campaigns, the full pipeline
+runs with seed 42 and 1200 users so a fresh deployment is never an empty
+dashboard. It runs on a **daemon thread, not the event loop** (the pipeline is
+synchronous and would block every request) and never delays the port binding.
+`/health` exposes `bootstrap: pending|running|complete|skipped|failed` plus a
+detail string, and always returns **200** — it is a liveness check, and Render
+must not restart a server that is serving fine but has an empty database.
+
+**`requirements.txt`** is a full `pip freeze` of the venv the tests pass
+against: 36 packages, every one an exact `==` pin including transitives. A test
+asserts no line contains `>=`, `~=`, `<` or `*`.
+
+### Frontend deploy config
+
+`vercel.json` rewrites every non-asset path to `/index.html`.
+`.env.example` documents `VITE_API_URL` and notes it is inlined at **build**
+time, so changing it in Vercel needs a redeploy.
+
+**Cold start.** Render sleeps after 15 minutes idle and takes 30-60s to wake,
+during which every request fails at the network layer. `useApiWakeup` probes
+`/health` before the dashboard mounts anything and gates all six section
+fetches on it:
+
+- < 3s: silent
+- ≥ 3s: "Waking up the API — free hosting sleeps when idle, this takes up to a
+  minute" with a progress bar and an elapsed/retry counter
+- retries with exponential backoff (1.5s → 8s cap) for **90 seconds**
+- only then the hard error, with a Try-again button
+
+A non-network HTTP error (4xx/5xx) short-circuits to "ready" — the server is
+awake and answering, so the sections should surface their own errors rather
+than the whole page claiming a cold start.
+
+### Verification performed
+
+- **394 tests pass** (28 new). Two existing tests needed updating for
+  deliberate changes: `/health` gained a `bootstrap` key, and the demo job's
+  params gained the cap fields.
+- **Production config via `./start.sh`**: `ENVIRONMENT=production`,
+  `CORS_ORIGINS=https://signalstack-demo.vercel.app,http://localhost:5173`,
+  `PORT=8010` — migrations applied, server bound, `/health` 200, https origin
+  allowed and an unlisted origin refused, 3000-user request clamped to 1500
+  with `users_capped: true`, peak RSS logged at 101.7 MB.
+- **Bootstrap against an empty scratch database** (`signalstack_scratch`,
+  created alongside the existing one, dropped afterwards): **bound and served
+  `/health` in 1.04 s**, returned 200 continuously while the bootstrap ran,
+  progressed `running (generating 1200 users)` → `running (replaying
+  quarantine)` → `complete` in 6.0 s, and ended with 12 campaigns / 3,090
+  touchpoints / 3,087 attribution rows. Restarting against the now-populated
+  database reported `skipped` with identical row counts. The original database
+  was untouched throughout.
+- **Cold-start UI**: killed the API, loaded the page — got the waking screen
+  with a progress bar at "4s elapsed · retry 2 · still trying"; restarted the
+  API mid-wait and the dashboard **recovered automatically without ever
+  showing an error**.
+- `npm run build` succeeds, exit 0.
+- `grep -rn "localhost\|127.0.0.1\|:8000" frontend/src/` → **no matches**; a
+  test enforces it (also barring `onrender.com`).
+
+### Notes / gotchas for future sessions
+
+1. **The bootstrap must never move onto the event loop.** It is synchronous,
+   DB-bound work taking ~6 s; on the loop it would block every request for
+   that whole window, and Render's health check with it. The daemon thread is
+   load-bearing, not incidental.
+
+2. **`/health` returns 200 even when the bootstrap failed.** That is
+   deliberate: it is a liveness probe. If it returned 503 on a failed
+   bootstrap, Render would restart the container in a loop while the API was
+   perfectly capable of serving. Read `bootstrap` in the body for the real
+   state.
+
+3. **`ru_maxrss` is bytes on macOS, kilobytes on Linux.** `peak_rss_mb()`
+   branches on `sys.platform`. Get it wrong and the production reading is
+   1024x off in the direction that looks fine.
+
+4. **Render's `rootDir: backend` is the single most common deploy mistake.**
+   Without it the build cannot find `requirements.txt` and the start command
+   fails with `ModuleNotFoundError: No module named 'app'`. DEPLOY.md flags it
+   in the table and in the troubleshooting list.
+
+5. **`start.sh` needs its executable bit committed.** Git tracks the mode; if
+   it is lost, Render fails with `Permission denied`. Restore with
+   `git update-index --chmod=+x backend/start.sh`. A test asserts the bit.
+
+6. **CORS is a two-pass deployment, by necessity.** The API needs the Vercel
+   URL, which does not exist until the frontend is built, which needs the
+   Render URL. Deploy the API with a placeholder, then come back — DEPLOY.md
+   step 4 is that step, and skipping it produces a dashboard that sits on
+   "Waking up the API" and then errors, with no CORS message visible to the
+   user.
+
+7. **Vercel preview deployments will not reach the API.** Each gets its own
+   hostname and none are in `CORS_ORIGINS`.
+
+8. **The demo cap is a margin, not a limit discovered by failure.** 3000 users
+   measured 120 MB peak against a 512 MB budget. If the free tier ever feels
+   tight, the accumulation to attack first is `runner._ingest_source`'s
+   per-source list (23 MB at 3000 users), not the generator or the attribution
+   engine.
+
+9. **`BOOTSTRAP_ON_EMPTY=false` disables self-population** — useful if a real
+   dataset is ever loaded and an accidental bootstrap would be unwelcome.
+   (It cannot overwrite anything: it checks for campaigns first.)
