@@ -107,4 +107,26 @@ export const startDemoReset = (payload, signal) =>
 export const getDemoStatus = (jobId, signal) =>
   request(`/api/demo/status/${encodeURIComponent(jobId)}`, { signal });
 
+/**
+ * True when the configured API is on this machine.
+ *
+ * Drives which recovery advice the error screen shows: shell commands are
+ * useful to a developer running the stack locally and actively confusing to
+ * someone who has opened the public demo URL.
+ */
+function detectLocalApi(url) {
+  const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]']);
+  try {
+    // An empty VITE_API_URL means same-origin, so judge by the page's host.
+    const hostname = url
+      ? new URL(url, window.location.origin).hostname
+      : window.location.hostname;
+    return LOCAL_HOSTS.has(hostname.replace(/^\[|\]$/g, ''));
+  } catch {
+    return false;
+  }
+}
+
+export const IS_LOCAL_API = detectLocalApi(BASE_URL);
+
 export { BASE_URL };

@@ -1386,3 +1386,85 @@ than the whole page claiming a cold start.
 9. **`BOOTSTRAP_ON_EMPTY=false` disables self-population** — useful if a real
    dataset is ever loaded and an accidental bootstrap would be unwelcome.
    (It cannot overwrite anything: it checks for campaigns first.)
+
+## Phase 10 — Polish and documentation
+
+Date: 2026-09-15
+
+Small, safe changes only. Live at
+https://signalstack-ecru.vercel.app (Vercel) →
+https://signalstack-9mqj.onrender.com (Render) → Neon.
+
+### Error screen no longer shows shell commands in production
+
+The API-unreachable screen told everyone to run `cd backend && ./start.sh` —
+correct locally, nonsense to someone who opened the public URL. `api.js` now
+exports `IS_LOCAL_API`, derived from the hostname in `VITE_API_URL` (falling
+back to the page's own host when it is unset, i.e. a same-origin deployment).
+The shell advice sits behind that flag; otherwise the screen explains that the
+API is on free hosting, sleeps when idle, and is worth retrying.
+
+Verified by pointing a dev server at a dead non-localhost host and waiting out
+the full 90-second retry window: the production copy rendered, with no shell
+commands.
+
+### README rewritten for a cold reader
+
+Rewritten for someone landing on the public repo: one-line description, the
+live link with the cold-start caveat, the problem in three sentences, a
+concrete result from live data, an ASCII architecture diagram, the stack,
+engineering highlights with specific numbers rather than adjectives, exact
+local-setup commands from a fresh clone, and a plain-language description of
+the five models.
+
+### DEMO.md
+
+A five-minute interview walkthrough: what to do 30 seconds before starting
+(wake the API), a 60-second version, a 3-minute section-by-section walk with
+what to say and click, a deep-dive covering `/docs`, the quarantine table and
+the replay cascade, and honest answers to the questions this project invites —
+including which model is correct (none), why email ROAS is absurd (my cost
+model, flagged not shipped), what changes at scale, and how the numbers are
+known to be right (invariants, not spot checks).
+
+### Live verification
+
+All endpoints green against the live API. Full results in the Phase 10 report;
+the headline figures now quoted in the README are live values:
+
+| Channel | first_touch | last_touch | swing |
+| --- | --- | --- | --- |
+| display | $24,617.86 | $1,844.46 | $22,773.40 |
+| paid_search | $560.97 | $15,963.88 | $15,402.91 |
+| email | $1,618.57 | $11,713.19 | $10,094.62 |
+
+All five models total exactly $48,405.73; total contested revenue $60,998.11.
+
+### Notes / gotchas for future sessions
+
+1. **`CORS_ORIGINS` on Render contains only the Vercel origin.** The task for
+   this phase assumed the Render deployment URL was also listed; probing every
+   candidate shows it is not, and neither is `localhost:5173`. This is
+   **functionally harmless**: the only browser page served from the Render
+   origin is `/docs`, and Swagger UI makes *same-origin* requests, which never
+   consult CORS (verified — `/docs` returns 200 and works). The real
+   consequence is that a **local** frontend cannot call the **live** API from a
+   browser. If that is ever wanted, append
+   `http://localhost:5173,https://signalstack-9mqj.onrender.com` to
+   `CORS_ORIGINS` in the Render dashboard. Left alone here rather than changing
+   live production config unprompted.
+
+2. **Live email ROAS is 74.81x, not the 197x quoted from local data.** Both are
+   artifacts of the same near-zero email cost model; the figure just scales
+   with the dataset. DEMO.md quotes the live number. Do not repeat a
+   remembered figure — read it off the page.
+
+3. **The "no hardcoded localhost" test had to be sharpened, not relaxed.**
+   `IS_LOCAL_API` legitimately compares against a set of local hostnames, which
+   the old substring grep flagged. The test now matches URL *literals* (a
+   scheme plus a host, or either deployment domain), so it still catches
+   `fetch('http://localhost:8000/...')` while allowing a hostname predicate.
+
+4. **Live figures in the README will drift** if anyone presses **Run pipeline**,
+   which regenerates with a random seed. The table is labelled as a snapshot
+   from live data; re-read `/api/model-comparison` before quoting it.

@@ -361,16 +361,44 @@ def test_frontend_deploy_files_exist():
     assert "VITE_API_URL" in (frontend / ".env.example").read_text()
 
 
-def test_no_hardcoded_api_host_in_frontend_source():
-    """VITE_API_URL is the only way the frontend learns the API's location."""
+def test_no_hardcoded_api_url_in_frontend_source():
+    """VITE_API_URL is the only way the frontend learns the API's location.
+
+    This looks for URL *literals* (a scheme plus a host), not bare hostnames:
+    `api.js` legitimately compares against a set of local hostnames to decide
+    whether to show shell commands on the error screen, which is not a
+    hardcoded endpoint.
+    """
+    import re
+
     src = REPO_ROOT / "frontend" / "src"
+    # A scheme-qualified local address, or either deployment host.
+    forbidden = re.compile(
+        r"https?://(?:localhost|127\.\d|0\.0\.0\.0|\[?::1\]?)"
+        r"|[A-Za-z0-9-]+\.onrender\.com"
+        r"|[A-Za-z0-9-]+\.vercel\.app",
+        re.IGNORECASE,
+    )
     offenders = []
     for path in src.rglob("*.js*"):
-        text = path.read_text()
-        for needle in ("localhost", "127.0.0.1", "onrender.com"):
-            if needle in text:
-                offenders.append(f"{path.relative_to(src)}: {needle}")
-    assert not offenders, f"hardcoded host in frontend source: {offenders}"
+        for match in forbidden.finditer(path.read_text()):
+            offenders.append(f"{path.relative_to(src)}: {match.group(0)}")
+    assert not offenders, f"hardcoded API URL in frontend source: {offenders}"
+
+
+def test_error_screen_gates_local_instructions_on_a_local_api():
+    """Shell commands must not be shown to someone on the public URL."""
+    src = REPO_ROOT / "frontend" / "src"
+    api_js = (src / "api.js").read_text()
+    wakeup = (src / "components" / "ApiWakeup.jsx").read_text()
+
+    # The predicate exists and is exported.
+    assert "export const IS_LOCAL_API" in api_js
+    # The error screen branches on it, and the shell advice sits on the local
+    # branch while a free-hosting explanation sits on the other.
+    assert "IS_LOCAL_API ?" in wakeup
+    assert "./start.sh" in wakeup
+    assert "free hosting" in wakeup
 
 
 def test_peak_rss_is_reported_in_megabytes():

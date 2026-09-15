@@ -1,4 +1,4 @@
-import { BASE_URL } from '../api';
+import { BASE_URL, IS_LOCAL_API } from '../api';
 
 /**
  * The cold-start screen. Shown instead of the dashboard while the API wakes,
@@ -46,11 +46,20 @@ export function ApiUnreachable({ error, onRetry }) {
           Nothing answered at <code>{BASE_URL || '(VITE_API_URL is unset)'}</code>{' '}
           after 90 seconds, so it is probably not just a cold start.
         </p>
-        <p className="page-error-body">
-          Running locally? Start it with{' '}
-          <code>cd backend &amp;&amp; ./start.sh</code> and make sure Postgres is
-          up (<code>docker compose up -d</code>).
-        </p>
+        {IS_LOCAL_API ? (
+          <p className="page-error-body">
+            Running locally? Start it with{' '}
+            <code>cd backend &amp;&amp; ./start.sh</code> and make sure Postgres
+            is up (<code>docker compose up -d</code>).
+          </p>
+        ) : (
+          <p className="page-error-body">
+            The API runs on free hosting, which sleeps when idle and can take up
+            to a minute to wake. Waiting a moment and retrying usually fixes it.
+            If it keeps failing, the service may be redeploying — try again in a
+            few minutes.
+          </p>
+        )}
         {error?.detail && (
           <p className="page-error-body" style={{ fontSize: 12.5 }}>
             {error.detail}

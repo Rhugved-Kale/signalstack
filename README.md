@@ -1,370 +1,204 @@
 # SignalStack
 
-An ad performance attribution pipeline: it ingests campaign and revenue data, runs
-multi-touch attribution, and serves the results to a dashboard.
+An ad performance attribution pipeline that ingests campaign, event and revenue
+data, scores every conversion under five multi-touch attribution models, and
+serves the results to a dashboard.
 
-> Status: Phase 7 — complete. Pipeline, attribution engine, API and dashboard.
+**Live demo: https://signalstack-ecru.vercel.app**
 
-## Folder structure
+> The API runs on Render's free tier, which sleeps after 15 minutes idle. The
+> first load can take up to 60 seconds while it wakes — the dashboard shows a
+> progress indicator and retries automatically, so give it a moment rather than
+> reloading.
+
+## The problem
+
+Most marketing reporting credits the last click before a purchase, which
+systematically over-credits the bottom of the funnel: search and email get paid
+for demand that display and social created. Any other rule for splitting the
+credit produces a completely different ranking of which channels are worth
+funding. SignalStack computes five of those rules over the same conversions and
+puts the disagreement on screen, so the choice of model becomes visible instead
+of buried in a reporting default.
+
+## A concrete result
+
+From the live dataset — identical conversions, identical spend, only the
+attribution model differs:
+
+| Channel | First-touch | Last-touch | Swing |
+| --- | --- | --- | --- |
+| display | $24,617.86 | $1,844.46 | **$22,773.40** |
+| paid_search | $560.97 | $15,963.88 | $15,402.91 |
+| email | $1,618.57 | $11,713.19 | $10,094.62 |
+
+Display is worth **13x more** under first-touch than last-touch. All five models
+distribute exactly the same $48,405.73 of revenue; they disagree only about who
+earned it, and across all channels $60,998.11 of revenue is contested.
+
+## Architecture
 
 ```
-signalstack/
-  backend/
-    app/
-      __init__.py
-      main.py            # FastAPI app + GET /health
-      config.py          # pydantic-settings config, exports `settings`
-      api/
-        routes.py        # endpoints under /api
-        schemas.py       # Pydantic v2 response models
-        jobs.py          # demo-reset job registry
-      db/
-        base.py          # declarative Base
-        session.py       # engine, SessionLocal, get_db() dependency
-        models.py        # ORM models (7 tables)
-      generator/
-        world.py         # coherent fake world (journeys, spend)
-        fake_apis.py     # fake HTTP APIs with realistic failure modes
-        cli.py           # inspection CLI
-      pipeline/
-        schemas.py       # Pydantic v2 validation per source record
-        fetcher.py       # pagination + retry policy
-        loaders.py       # idempotent batch upserts
-        runner.py        # per-source orchestration
-        replay.py        # dependency-ordered quarantine replay
-        cli.py           # ingestion CLI
-      attribution/
-        journeys.py      # batched journey assembly
-        models.py        # the five attribution models
-        engine.py        # scoring runner (idempotent upserts)
-        analytics.py     # rollups for the dashboard
-        cli.py           # attribution CLI
-    alembic/             # migration environment
-      versions/          # migration scripts
-    alembic.ini
-    tests/
-      test_db.py         # round-trip test against the real database
-      test_generator.py  # generator tests (no database)
-      test_pipeline.py   # pipeline tests (real database)
-      test_attribution.py # attribution tests
-      test_api.py        # API tests (TestClient)
-    requirements.txt
-    .env.example
-  frontend/              # Vite + React dashboard (JavaScript)
-    src/
-      api.js             # every API call
-      theme.js           # channel + model colour scales
-      format.js          # money / count / ROAS formatters
-      selectors.js       # pure derivations over API responses
-      hooks/             # useApi, usePrefersDark
-      components/        # one component per dashboard section
-  docker-compose.yml     # postgres:16
-  .gitignore
-  README.md
-  PROGRESS.md            # running log across phases
+  ┌─────────────┐   three fake HTTP APIs that rate-limit, time out,
+  │  Generator  │   return 500s, and corrupt ~7% of records
+  └──────┬──────┘
+         │ paginated JSON
+  ┌──────▼──────┐   fetch with retry -> validate -> route -> batch upsert
+  │  Ingestion  │   bad records go to quarantine with their raw payload
+  └──────┬──────┘
+         │
+  ┌──────▼──────┐   campaigns, ad_spend, touchpoints, conversions,
+  │  Postgres   │   attribution_results, ingestion_runs, quarantined_records
+  └──────┬──────┘
+         │
+  ┌──────▼──────┐   reconstruct each conversion's journey within a 30-day
+  │ Attribution │   lookback, score it under all five models
+  └──────┬──────┘
+         │
+  ┌──────▼──────┐   FastAPI: channel performance, model comparison,
+  │     API     │   timeseries, journeys, pipeline health
+  └──────┬──────┘
+         │
+  ┌──────▼──────┐   React single page: hero stats, channel bars,
+  │  Dashboard  │   model comparison, journey explorer
+  └─────────────┘
 ```
 
-## Run the whole thing
+- **Generator** — builds a coherent fake world first (users with real multi-touch
+  journeys, not random rows), then serves it through APIs that fail like real
+  ones. Deterministic per seed.
+- **Ingestion** — walks pagination, retries transport failures, validates every
+  record, and quarantines what fails instead of crashing or silently dropping it.
+- **Postgres** — natural keys and unique constraints make re-ingestion a no-op.
+- **Attribution** — assembles journeys in batches, then scores each one under
+  five models in a single pass.
+- **API** — thin: validate the query string, call an analytics function,
+  serialise.
+- **Dashboard** — one page, no router; the model selector re-scores everything.
 
-Three terminals, in this order.
+## Tech stack
 
-**1. Postgres**
+Python 3.13, FastAPI, SQLAlchemy 2.0, Alembic, Pydantic v2, psycopg 3, Postgres
+16, pytest; React 19, Vite, Recharts; Neon, Render, Vercel.
 
-```bash
-docker compose up -d
-```
+## Engineering highlights
 
-**2. API** — http://localhost:8000, interactive docs at `/docs`
-
-```bash
-cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
-```
-
-**3. Dashboard** — http://localhost:5173
-
-```bash
-cd frontend && npm run dev
-```
-
-If the database is empty, populate it — either click **Run pipeline** in the
-dashboard header, or from the command line:
-
-```bash
-cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000 --replay
-```
-
-```bash
-cd backend && .venv/bin/python -m app.attribution.cli --rebuild
-```
-
-> `pytest` truncates the data tables, so re-run those two commands after a test
-> run.
-
-## Dashboard
-
-A single page, four sections, no router:
-
-1. **Hero stats** — attributed revenue, spend, blended ROAS, conversions and
-   touchpoints, plus a spotlight on the largest model disagreement.
-2. **Channel performance** — attributed revenue per channel for the selected
-   model, as animated bars and a table. Bars re-order when the model changes;
-   each channel keeps its colour.
-3. **Model comparison** — five bars per channel, one per model, with a swing
-   column. The centrepiece: display is worth $57,931 under first-touch and
-   $2,221 under last-touch on the same data.
-4. **Journeys & pipeline** — expandable customer paths showing per-touch
-   credit, beside ingestion runs and quarantine reasons.
-
-The header's **Run pipeline** button rebuilds the entire dataset (generate →
-ingest → replay → attribute) in the background, streaming per-stage progress,
-then refetches every section.
-
-Set the API location with `VITE_API_URL` in `frontend/.env`.
+- **Idempotent ingestion.** Re-running the pipeline changes no row counts. The
+  second run of an identical dataset was 8,754 updates and **0 inserts**, with
+  zero duplicate natural keys, because every loader upserts on the key the
+  schema already enforces.
+- **Validation with quarantine, not crash-or-drop.** A malformed record is
+  written to `quarantined_records` with its **raw payload preserved** and a
+  human-readable reason, so nothing is lost and nothing aborts the run. A single
+  bad record costs exactly that record.
+- **Dependency-ordered quarantine replay.** One campaign arrived with a dropped
+  field, and every child record referencing it was then quarantined as an orphan
+  — **462 touchpoints and 58 ad_spend rows from one bad parent**, 56% of all
+  quarantine volume. Replay re-fetches parents first, then re-drives children:
+  re-fetching that **one** campaign recovered **all 462**.
+- **Exact decimal arithmetic.** Credit and revenue are apportioned by the
+  largest-remainder method, never multiplied and rounded. Credits sum to exactly
+  `1.000000` and attributed revenue reconciles **to the cent** across all five
+  models — `$100.01` split three ways is `33.34 + 33.34 + 33.33`, never
+  `$100.02`. No float touches the credit path, including the timestamp
+  arithmetic behind time decay.
+- **Retry with exponential backoff.** 500s and timeouts retry with jittered
+  backoff (0.5s → 8s, 5 attempts); a 429 waits exactly its `retry_after` instead
+  of guessing. Validation failures are never retried — reproducing a malformed
+  record is pointless.
+- **Semantic timestamp validation.** A corrupted Unix-epoch timestamp parses
+  perfectly and is still absurd. This was caught only when a downstream summary
+  endpoint reported a **4-year date range on a 60-day dataset** — a min/max over
+  a column turned out to be a better corruption detector than the per-record
+  validator, because it asks a question no single record can answer.
+- **Self-bootstrapping deployment.** On first boot against an empty database the
+  API generates, ingests, replays and scores a dataset on a background thread,
+  so a fresh deploy is never a blank dashboard. It never delays the port binding
+  (measured: `/health` served in 1.04s while still generating) and reports
+  progress through `/health`.
+- **~390 tests**, including the penny-leak allocation across 175 model/length/
+  amount combinations, idempotency against a real Postgres, and assertions that
+  the deployment artefacts stay correct (every requirement exactly pinned,
+  `start.sh` executable, no hardcoded API URL in the frontend).
 
 ## Local setup
 
-### 1. Postgres
+Requires Docker, Python 3.13 and Node 20+.
+
+```bash
+git clone https://github.com/Rhugved-Kale/signalstack.git && cd signalstack
+```
+
+**1. Start Postgres** (published on host port 5433 to avoid colliding with a
+local install):
 
 ```bash
 docker compose up -d
 ```
 
-Verify it is healthy:
+**2. Backend** — create the venv, install, migrate:
 
 ```bash
-docker compose ps
-```
-
-The container is published on host port **5433** (not 5432) so it cannot collide
-with a Postgres you already run locally. It still listens on 5432 inside the
-container.
-
-Then apply the migrations — see [Database](#database).
-
-### 2. Backend
-
-```bash
-cd backend
-python3.13 -m venv .venv
+cd backend && python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 ```bash
-cd backend && .venv/bin/pip install -r requirements.txt
+cd backend && cp .env.example .env && .venv/bin/alembic upgrade head
 ```
 
-```bash
-cd backend && cp .env.example .env
-```
-
-```bash
-cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
-```
-
-Check it:
-
-```bash
-curl http://localhost:8000/health
-```
-
-```json
-{"status":"ok","service":"signalstack-api","environment":"local"}
-```
-
-### 3. Frontend
-
-```bash
-cd frontend && npm install
-```
-
-```bash
-cd frontend && npm run dev
-```
-
-The dev server runs on http://localhost:5173 and expects the API at the
-`VITE_API_URL` in `frontend/.env` (default `http://localhost:8000`).
-
-Production build:
-
-```bash
-cd frontend && npm run build
-```
-
-## Database
-
-Postgres 16 runs in Docker, published on host port **5433**. Schema changes are
-managed with Alembic; all Alembic commands must be run from `backend/` so that
-`backend/.env` is picked up.
-
-### Start Postgres
-
-```bash
-docker compose up -d
-```
-
-```bash
-docker compose ps
-```
-
-### Apply migrations
-
-```bash
-cd backend && .venv/bin/alembic upgrade head
-```
-
-### Other migration commands
-
-Show the currently applied revision:
-
-```bash
-cd backend && .venv/bin/alembic current
-```
-
-Roll all the way back (drops every application table):
-
-```bash
-cd backend && .venv/bin/alembic downgrade base
-```
-
-Check whether the models have drifted from the database:
-
-```bash
-cd backend && .venv/bin/alembic check
-```
-
-Create a new migration after changing `app/db/models.py`:
-
-```bash
-cd backend && .venv/bin/alembic revision --autogenerate -m "describe the change"
-```
-
-### Connect with psql
-
-```bash
-psql "postgresql://signalstack:signalstack@localhost:5433/signalstack"
-```
-
-### Tables
-
-| Table | Purpose |
-| --- | --- |
-| `campaigns` | Campaign dimension, keyed to the ad platform by `external_id` |
-| `ad_spend` | Daily spend / impressions / clicks per campaign |
-| `touchpoints` | Individual marketing interactions per user |
-| `conversions` | Revenue events to be attributed |
-| `attribution_results` | Credit per conversion, touchpoint and model |
-| `ingestion_runs` | Audit log of ingestion attempts |
-| `quarantined_records` | Records that failed validation, kept verbatim |
-
-### Run the database test
-
-Requires Postgres up and migrations applied:
-
-```bash
-cd backend && .venv/bin/python -m pytest
-```
-
-## Synthetic data generator
-
-`app.generator` builds an internally consistent fake world — real multi-touch
-user journeys, not random rows — and serves it through fake HTTP-like APIs that
-rate-limit, time out, return 500s, and corrupt records the way real upstreams
-do. It never touches the database; it returns plain dicts.
-
-Inspect a world and write sample API payloads:
-
-```bash
-cd backend && .venv/bin/python -m app.generator.cli --seed 42 --out samples/
-```
-
-The same seed always produces the same world. See PROGRESS.md → "Phase 3" for
-the channel/funnel model and the full list of failure modes.
-
-## Ingestion pipeline
-
-Pulls the generated world through the fake APIs and into Postgres: retry on
-transport failures, validate every record, quarantine what fails, and upsert
-the rest idempotently.
-
-```bash
-cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000
-```
-
-Flags: `--seed`, `--users`, `--failure-profile {none,normal,chaos}`, `--reset`
-(TRUNCATE all data tables first), `--quiet`. Running it twice without `--reset`
-leaves the data tables unchanged — the upserts are keyed on the natural keys
-from the Phase 2 schema.
-
-Replay quarantined records in dependency order — re-fetching parent campaigns
-so orphaned children can load:
+**3. Populate the database** — generate, ingest, replay quarantine, then score:
 
 ```bash
 cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000 --replay
 ```
 
 ```bash
-cd backend && .venv/bin/python -m app.pipeline.cli --replay-only
-```
-
-See PROGRESS.md → "Phase 4" for the retry policy, what gets quarantined and
-why, and the `received == ingested + quarantined` counter identity; "Phase 4.5"
-covers replay and the currency allowlist.
-
-## Attribution engine
-
-Scores every conversion under five multi-touch models — `last_touch`,
-`first_touch`, `linear`, `time_decay`, `position_based` — and stores all five
-side by side so the dashboard can show how much they disagree.
-
-```bash
 cd backend && .venv/bin/python -m app.attribution.cli --rebuild
 ```
 
-Flags: `--rebuild`, `--lookback-days`, `--half-life-days`, `--model`
-(repeatable), `--quiet`. Re-running without `--rebuild` is a no-op on row
-counts — the upserts are keyed on
-`(conversion_id, touchpoint_id, model_name)`.
-
-All credit arithmetic is `Decimal` with largest-remainder apportionment, so
-credits sum to exactly `1.000000` and attributed revenue sums to the
-conversion's revenue to the cent. See PROGRESS.md → "Phase 5".
-
-> Note: `pytest` truncates the data tables, so re-run the pipeline CLI before
-> an attribution demo.
-
-## API
+**4. Run the API** (http://localhost:8000, docs at `/docs`):
 
 ```bash
 cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
 ```
 
-Interactive docs at http://localhost:8000/docs.
-
-| Method | Path | What it returns |
-| --- | --- | --- |
-| GET | `/health` | liveness probe |
-| GET | `/api/models` | the five models and what each assumes |
-| GET | `/api/channels?model=` | revenue, spend and ROAS per channel |
-| GET | `/api/model-comparison` | the same revenue under every model, plus swing |
-| GET | `/api/timeseries?model=&granularity=` | attributed revenue over time |
-| GET | `/api/journeys?model=&limit=` | customer paths with per-touch credit |
-| GET | `/api/pipeline/health` | ingestion runs, quarantine, row counts |
-| GET | `/api/summary?model=` | headline numbers for the dashboard hero |
-| POST | `/api/demo/reset` | rebuild the whole dataset (202 + job id) |
-| GET | `/api/demo/status/{job_id}` | poll a demo reset job |
-
-Rebuild the entire dataset from the API — generate, ingest, replay, attribute:
+**5. Run the dashboard** (http://localhost:5173), in a second terminal:
 
 ```bash
-curl -X POST http://localhost:8000/api/demo/reset -H 'Content-Type: application/json' -d '{"seed":42,"users":3000,"failure_profile":"normal"}'
+cd frontend && npm install && npm run dev
 ```
 
-Money serialises as a JSON number; `roas` is `null` (not `0`) for channels with
-no spend. See PROGRESS.md → "Phase 6".
+**Tests:**
 
-## Configuration
+```bash
+cd backend && .venv/bin/python -m pytest -q
+```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `DATABASE_URL` | `postgresql+psycopg://signalstack:signalstack@localhost:5433/signalstack` | SQLAlchemy connection string |
-| `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated allowed browser origins |
-| `ENVIRONMENT` | `local` | Environment name, surfaced by `/health` |
+> The test suite truncates the data tables, so re-run step 3 afterwards if you
+> want a populated dashboard.
+
+## How it works
+
+Each conversion's journey is every touchpoint from the same user within a 30-day
+lookback, ordered in time. Each model splits that conversion's revenue across
+those touchpoints differently:
+
+- **last_touch** — 100% to the final touchpoint. Assumes whatever closed the sale
+  caused it. Flatters search and email.
+- **first_touch** — 100% to the first touchpoint. Assumes discovery is everything
+  and nurture is free. Flatters display and social.
+- **linear** — equal credit to every touchpoint. Assumes no touch matters more
+  than another; wrong, but unbiased about which direction it is wrong in.
+- **time_decay** — credit decays exponentially toward the conversion with a
+  7-day half-life. Assumes influence fades.
+- **position_based** — 40% first, 40% last, 20% shared by the middle. Assumes
+  discovery and closing are the hard parts.
+
+None of them is correct. They encode different beliefs about how marketing
+works, and the dashboard exists to make the size of that disagreement legible.
+
+## Deployment
+
+See [DEPLOY.md](DEPLOY.md) for Neon, Render and Vercel setup, and
+[DEMO.md](DEMO.md) for a walkthrough of the live app. [PROGRESS.md](PROGRESS.md)
+is the build log, one section per phase, including the gotchas each phase hit.
