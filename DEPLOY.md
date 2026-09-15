@@ -22,11 +22,11 @@ comes back to fix it. Expect to touch Render twice.
 a Git remote):
 
 ```bash
-git remote add origin https://github.com/<you>/signalstack.git
+git remote add origin https://github.com/Rhugved-Kale/signalstack.git
 ```
 
 ```bash
-git push -u origin master
+git push -u origin main
 ```
 
 ---
@@ -235,7 +235,7 @@ or `http` vs `https`.
 
 ## Redeploying
 
-🤖 Both platforms deploy on push to `master`. Backend changes trigger Render
+🤖 Both platforms deploy on push to `main`. Backend changes trigger Render
 (migrations included), frontend changes trigger Vercel.
 
 ⌨️ To rebuild the demo dataset without redeploying, use the dashboard's **Run
