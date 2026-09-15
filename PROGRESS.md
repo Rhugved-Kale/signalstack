@@ -834,3 +834,128 @@ the 8 empty-journey conversions.
 11. **`credit` is `NUMERIC(8,6)`**, which holds `[0, 99.999999]` — fine for a
     fraction in `[0, 1]` at exactly 6 decimal places. If a future model ever
     emits credits above 1 (e.g. an uplift model), the column needs widening.
+
+## Phase 6 — API layer
+
+Date: 2026-09-14
+
+Scope: HTTP endpoints only. No frontend. The layer is deliberately thin —
+every route validates its input, calls an existing `analytics.py` or runner
+function, and serialises the result. There is no attribution or pipeline logic
+in `app/api/`.
+
+### Files added
+
+- `backend/app/api/schemas.py` — Pydantic v2 response models.
+- `backend/app/api/routes.py` — the endpoints, mounted under `/api`.
+- `backend/app/api/jobs.py` — in-process job registry for the demo button.
+- `backend/app/api/__init__.py` — exports the router.
+- `backend/app/main.py` — rewritten: router, middleware, exception handlers,
+  OpenAPI metadata. `GET /health` is byte-for-byte unchanged.
+- `backend/tests/test_api.py` — 34 tests.
+
+### Endpoints
+
+| Method | Path | Backed by |
+| --- | --- | --- |
+| GET | `/health` | unchanged from Phase 1 (deployment probes use it) |
+| GET | `/api/models` | static catalogue with a description per model |
+| GET | `/api/channels` | `channel_performance()` |
+| GET | `/api/model-comparison` | `model_comparison()` |
+| GET | `/api/timeseries` | `timeseries()` |
+| GET | `/api/journeys` | `top_journeys()` |
+| GET | `/api/pipeline/health` | `pipeline_health()` |
+| GET | `/api/summary` | composed from the three above |
+| POST | `/api/demo/reset` | `reset_data` → `run_ingestion` → `replay_quarantine` → `run_attribution` |
+| GET | `/api/demo/status/{job_id}` | the job registry |
+
+Validation: `model` and `granularity` are `Enum`s, so FastAPI documents the
+valid values and rejects anything else with a 422 that lists them;
+`start_date > end_date` raises a 422 naming both dates; `limit` is a hard cap
+at 100 (`le=100` → 422) rather than a silent clamp, because silently returning
+20 rows when 500 were asked for is worse than saying no.
+
+### The demo reset job pattern
+
+`POST /api/demo/reset` returns **202 immediately** with a job id and kicks the
+work into a Starlette `BackgroundTask`. Job state lives in one module-level
+dict guarded by a `threading.Lock`: status (`running`/`success`/`failed`),
+`started_at`, `finished_at`, per-stage progress with details, and an error
+message. A second request while one is in flight gets **409** with the active
+job id. History is pruned to the last 20 jobs so the dict cannot grow forever.
+
+The background worker opens its **own** `SessionLocal` — the request's session
+is already closed by the time it runs — and records per-stage detail as it
+goes, so the frontend can show "ingest: 9,862 received, 924 quarantined" while
+the run is still going.
+
+Verified end to end: the endpoint rebuilt the full 3,000-user dataset in 7.5s
+and reproduced the CLI's numbers exactly (9,862 received → 521 replayed →
+8,273 attribution rows).
+
+### Error handling
+
+- Unhandled exceptions → 500 `{"error", "detail"}`, traceback to the log only.
+- `OperationalError` / `InterfaceError` → **503** with an actionable message
+  ("check that Postgres is running"), because a dead database is not the
+  client's fault and the request is worth retrying.
+- Request-logging middleware logs `method path -> status in Xms` and adds an
+  `X-Response-Time-ms` header.
+
+### Notes / gotchas for future sessions
+
+1. **`Decimal` becomes a JSON number at this boundary, and only here.**
+   Pydantic v2 serialises `Decimal` as a *string* by default, which would make
+   every chart library in Phase 7 parse strings. `JsonDecimal` (a
+   `PlainSerializer` applied `when_used="json"`) emits a number while the
+   Python-side value stays `Decimal`. It is defined once in `api/schemas.py`;
+   do not hand-roll per-field serialisers. The float conversion happens at the
+   wire, never in the attribution arithmetic.
+
+2. **`roas` is `float | None` and null is meaningful.** Organic has no spend,
+   so it has no ROAS. The frontend must render "n/a", not "0.00x".
+
+3. **TestClient drains background tasks before returning the response.** A
+   real first `POST /api/demo/reset` has already *finished* by the time a
+   second request could arrive under test, so the 409 guard cannot be tested
+   with two sequential client calls. `test_second_demo_reset_while_one_is_
+   running_returns_409` registers a running job directly in the registry
+   instead. If that test ever looks redundant, this is why it is written that
+   way.
+
+4. **Testing the generic 500 handler needs `raise_server_exceptions=False`.**
+   Starlette's `ServerErrorMiddleware` re-raises unhandled exceptions into the
+   test client by default, so the assertion would never see the response body.
+   Handlers registered for a *specific* exception class (like
+   `OperationalError` → 503) are handled by `ExceptionMiddleware` and work
+   with a plain `TestClient`.
+
+5. **`/api/summary` is the one composed endpoint.** It sums
+   `channel_performance`, takes the top row of `model_comparison` (already
+   sorted by swing) and reads counts from `pipeline_health`. The only SQL in
+   the whole API layer is `_conversion_date_range`'s `min`/`max` — a metadata
+   lookup describing the dataset's extent, not a performance rollup, which is
+   why it did not go in `analytics.py`.
+
+6. **The API surfaced a real data bug that is not an API bug.**
+   `/api/summary` reports `date_range.start = "2022-12-11"` on a dataset that
+   covers 60 days. Cause: Phase 3's `timestamp_unix_int` corruptor emits
+   `randint(1_600_000_000, 1_800_000_000)` (2020-09-13 … 2027-01-15) and
+   Phase 4's validation accepts Unix epoch integers *by specification*, so
+   those corrupted values parse cleanly and are ingested. 2 conversions and
+   108 touchpoints currently sit outside the world window. Fixing it means
+   adding a plausibility window to `_parse_timestamp`, which is ingestion
+   work, not API work — deliberately left alone here. The out-of-window
+   touchpoints also fall outside the 30-day lookback, so they are silently
+   excluded from journeys.
+
+7. **`app.pipeline.cli` is imported for `FAILURE_PROFILES` and `reset_data`.**
+   That couples the API to a CLI module. It is fine for now, but if either
+   grows, move both into a shared `app/pipeline/profiles.py`.
+
+8. **`status.HTTP_422_UNPROCESSABLE_ENTITY` is deprecated** in this Starlette
+   version; use `HTTP_422_UNPROCESSABLE_CONTENT`. The remaining two warnings
+   in the test run come from Starlette/httpx internals, not this codebase.
+
+9. **Job state is lost on restart.** Acceptable for a demo control. If it ever
+   needs to survive a deploy, it belongs in a table, not a dict.

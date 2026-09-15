@@ -3,7 +3,7 @@
 An ad performance attribution pipeline: it ingests campaign and revenue data, runs
 multi-touch attribution, and serves the results to a dashboard.
 
-> Status: Phase 5 — attribution engine. No API or dashboard yet.
+> Status: Phase 6 — HTTP API. No frontend dashboard yet.
 
 ## Folder structure
 
@@ -14,7 +14,10 @@ signalstack/
       __init__.py
       main.py            # FastAPI app + GET /health
       config.py          # pydantic-settings config, exports `settings`
-      api/               # (empty) HTTP routers
+      api/
+        routes.py        # endpoints under /api
+        schemas.py       # Pydantic v2 response models
+        jobs.py          # demo-reset job registry
       db/
         base.py          # declarative Base
         session.py       # engine, SessionLocal, get_db() dependency
@@ -44,6 +47,7 @@ signalstack/
       test_generator.py  # generator tests (no database)
       test_pipeline.py   # pipeline tests (real database)
       test_attribution.py # attribution tests
+      test_api.py        # API tests (TestClient)
     requirements.txt
     .env.example
   frontend/              # Vite + React (JavaScript)
@@ -262,6 +266,36 @@ conversion's revenue to the cent. See PROGRESS.md → "Phase 5".
 
 > Note: `pytest` truncates the data tables, so re-run the pipeline CLI before
 > an attribution demo.
+
+## API
+
+```bash
+cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
+```
+
+Interactive docs at http://localhost:8000/docs.
+
+| Method | Path | What it returns |
+| --- | --- | --- |
+| GET | `/health` | liveness probe |
+| GET | `/api/models` | the five models and what each assumes |
+| GET | `/api/channels?model=` | revenue, spend and ROAS per channel |
+| GET | `/api/model-comparison` | the same revenue under every model, plus swing |
+| GET | `/api/timeseries?model=&granularity=` | attributed revenue over time |
+| GET | `/api/journeys?model=&limit=` | customer paths with per-touch credit |
+| GET | `/api/pipeline/health` | ingestion runs, quarantine, row counts |
+| GET | `/api/summary?model=` | headline numbers for the dashboard hero |
+| POST | `/api/demo/reset` | rebuild the whole dataset (202 + job id) |
+| GET | `/api/demo/status/{job_id}` | poll a demo reset job |
+
+Rebuild the entire dataset from the API — generate, ingest, replay, attribute:
+
+```bash
+curl -X POST http://localhost:8000/api/demo/reset -H 'Content-Type: application/json' -d '{"seed":42,"users":3000,"failure_profile":"normal"}'
+```
+
+Money serialises as a JSON number; `roas` is `null` (not `0`) for channels with
+no spend. See PROGRESS.md → "Phase 6".
 
 ## Configuration
 
