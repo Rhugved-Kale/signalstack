@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: signalstack-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: signalstack
+      POSTGRES_PASSWORD: signalstack
+      POSTGRES_DB: signalstack
+    ports:
+      - "5432:5432"
+    volumes:
+      - signalstack-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U signalstack -d signalstack"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  signalstack-pgdata:
