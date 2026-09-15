@@ -16,7 +16,7 @@ services:
     rootDir: backend
     plan: free
     region: oregon
-    branch: master
+    branch: main
 
     buildCommand: pip install -r requirements.txt
     # start.sh runs `alembic upgrade head` first and exits non-zero if the
