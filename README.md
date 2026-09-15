@@ -3,8 +3,7 @@
 An ad performance attribution pipeline: it ingests campaign and revenue data, runs
 multi-touch attribution, and serves the results to a dashboard.
 
-> Status: Phase 3 — synthetic data generator. No ingestion, attribution, or
-> dashboard logic yet.
+> Status: Phase 4 — ingestion pipeline. No attribution or dashboard logic yet.
 
 ## Folder structure
 
@@ -24,7 +23,12 @@ signalstack/
         world.py         # coherent fake world (journeys, spend)
         fake_apis.py     # fake HTTP APIs with realistic failure modes
         cli.py           # inspection CLI
-      pipeline/          # (empty) ingestion / transform jobs
+      pipeline/
+        schemas.py       # Pydantic v2 validation per source record
+        fetcher.py       # pagination + retry policy
+        loaders.py       # idempotent batch upserts
+        runner.py        # per-source orchestration
+        cli.py           # ingestion CLI
       attribution/       # (empty) multi-touch attribution logic
     alembic/             # migration environment
       versions/          # migration scripts
@@ -32,6 +36,7 @@ signalstack/
     tests/
       test_db.py         # round-trip test against the real database
       test_generator.py  # generator tests (no database)
+      test_pipeline.py   # pipeline tests (real database)
     requirements.txt
     .env.example
   frontend/              # Vite + React (JavaScript)
@@ -198,6 +203,24 @@ cd backend && .venv/bin/python -m app.generator.cli --seed 42 --out samples/
 
 The same seed always produces the same world. See PROGRESS.md → "Phase 3" for
 the channel/funnel model and the full list of failure modes.
+
+## Ingestion pipeline
+
+Pulls the generated world through the fake APIs and into Postgres: retry on
+transport failures, validate every record, quarantine what fails, and upsert
+the rest idempotently.
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000
+```
+
+Flags: `--seed`, `--users`, `--failure-profile {none,normal,chaos}`, `--reset`
+(TRUNCATE all data tables first), `--quiet`. Running it twice without `--reset`
+leaves the data tables unchanged — the upserts are keyed on the natural keys
+from the Phase 2 schema.
+
+See PROGRESS.md → "Phase 4" for the retry policy, what gets quarantined and
+why, and the `received == ingested + quarantined` counter identity.
 
 ## Configuration
 

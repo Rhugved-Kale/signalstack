@@ -381,3 +381,168 @@ cd backend && .venv/bin/python -m pytest tests/test_generator.py -q
     campaign_id.** The spec asked for both, so the organic campaign row is
     real but always has zero spend and zero events. Harmless, but do not treat
     it as a bug when reconciling.
+
+## Phase 4 — Ingestion pipeline
+
+Date: 2026-09-14
+
+Scope: ingestion only — fetch, validate, route, load. No attribution logic, no
+API endpoints, no frontend.
+
+### Files added
+
+- `backend/app/pipeline/schemas.py` — Pydantic v2 validation per source record.
+- `backend/app/pipeline/fetcher.py` — pagination + tenacity retry policy.
+- `backend/app/pipeline/loaders.py` — idempotent batch upserts.
+- `backend/app/pipeline/runner.py` — per-source orchestration.
+- `backend/app/pipeline/cli.py` — `python -m app.pipeline.cli`.
+- `backend/tests/test_pipeline.py` — 41 tests.
+
+### The flow
+
+For each source, in this order (**campaigns must be first** — everything else
+resolves campaigns by `external_id`, so ingesting them first would quarantine
+the lot):
+
+1. **Open** an `IngestionRun` with status `running` and commit it immediately,
+   so a crashed process still leaves the attempt on record.
+2. **Fetch** every page through `fetch_all_pages`, retrying each page
+   independently.
+3. **Validate** each record as it streams past. Valid records accumulate;
+   invalid ones go to `quarantined_records` with the raw payload and a
+   one-line reason. A rejection costs exactly that one record.
+4. **Load** the survivors with a batched upsert. Records whose campaign cannot
+   be resolved come back from the loader and are quarantined too.
+5. **Close** the run: `finished_at`, `retry_count`, the three counters, and a
+   status of `success` (nothing quarantined), `partial` (some were) or
+   `failed` (the source blew up).
+
+Each source commits on its own, so a late failure cannot undo earlier work.
+
+### Retry policy
+
+| Failure | Behaviour |
+| --- | --- |
+| `ServerError` (500/503) | retry, exponential backoff + jitter |
+| `FakeTimeoutError` | retry, exponential backoff + jitter |
+| `RateLimitError` (429) | retry, waiting exactly `retry_after` seconds |
+| anything else (e.g. `ValidationError`) | **not retried** — reproducing a data problem is pointless |
+
+5 attempts max, backoff from 0.5s capped at 8s. On exhaustion the fetcher
+raises `PipelineFetchError` carrying the last exception. Retries are counted in
+a `FetchStats` object the caller passes in (a generator cannot return a value)
+and land on `IngestionRun.retry_count`. `sleep_fn` is injectable so tests run
+instantly.
+
+### What gets quarantined, and why
+
+Validation rejects: nulls, empty strings and unparseable values in required
+fields; negative spend or revenue; `clicks > impressions`; a currency that is
+not three alphabetic letters; unparseable timestamps. Tolerated as ordinary API
+sloppiness: numeric strings (`"42.50"`), naive timestamps (assumed UTC), Unix
+epoch timestamps, and unknown extra fields (ignored, never fatal).
+
+Referential rejects: a touchpoint or ad-spend row naming a campaign that does
+not exist. These are quarantined rather than nulled — nulling a touchpoint's
+`campaign_id` would silently relabel paid traffic as organic and corrupt every
+attribution result downstream. An *explicitly null* `campaign_id` is fine
+(organic); a **missing** `campaign_id` key is rejected, because a dropped field
+is indistinguishable from real absence.
+
+### Running the CLI
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000
+```
+
+Flags: `--seed` (42), `--users` (3000), `--failure-profile {none,normal,chaos}`
+(normal), `--reset` (TRUNCATE all data tables RESTART IDENTITY CASCADE), and
+`--quiet`. Prints a per-source table plus the top 5 quarantine reasons.
+
+```bash
+cd backend && .venv/bin/python -m pytest tests/test_pipeline.py -q
+```
+
+### Counter identity
+
+    records_received == records_ingested + records_quarantined
+
+Exact, and test-enforced per source and in total. `records_ingested` counts
+unique rows upserted **plus in-batch duplicates that were dropped**, because a
+dropped duplicate's data *is* in the database — its twin put it there.
+`IngestionRun` has no column for the breakdown, so `rows_inserted`,
+`rows_updated` and `duplicates_dropped` are returned in the result dict
+instead.
+
+### Verification performed
+
+Two consecutive runs at `--users 3000`, the second without `--reset`:
+identical `received/ingested/quarantined` (9,862 / 8,938 / 924) both times, but
+`rows_inserted` went 8,754 → **0** and `rows_updated` 0 → **8,754**. Row counts
+were byte-identical before and after (campaigns 11, ad_spend 633, touchpoints
+7,417, conversions 693) and every duplicate-key check returned 0.
+
+### Notes / gotchas for future sessions
+
+1. **One corrupted campaign cascades hard.** In the 3,000-user run a single
+   malformed campaign record (1 of 12) was quarantined, and because that
+   campaign never loaded, **462 touchpoints and 58 ad_spend rows** referencing
+   it were quarantined as "unknown campaign_id" — 56% of all quarantine volume
+   traced to one bad parent row. This is correct behaviour, not a bug, but it
+   means the highest-value recovery action is replaying quarantined *campaign*
+   records first. A future phase should re-drive quarantine in dependency
+   order.
+
+2. **In-batch dedupe is mandatory, not an optimisation.** Postgres raises
+   "ON CONFLICT DO UPDATE command cannot affect row a second time" if one
+   statement touches the same conflict key twice, and the generator emits
+   duplicates by design. `loaders._dedupe` collapses them last-wins (matching
+   upsert semantics) before the statement runs.
+
+3. **Inserted vs updated comes from Postgres's `xmax`.** `RETURNING xmax = 0`
+   is true for a row the statement inserted, false for one it updated. Keeps
+   it to one round trip per batch instead of a pre-flight SELECT.
+
+4. **`ingested_at` is refreshed on conflict**, so re-ingesting bumps it. Row
+   counts stay identical but `ingested_at` moves — that is deliberate
+   (last-seen time), so do not treat it as an idempotency violation.
+
+5. **`ingestion_runs` and `quarantined_records` are append-only audit tables.**
+   They grow by one set per run (4 → 8 runs, 924 → 1,848 quarantine rows across
+   the two demo runs). Only the four data tables are idempotent.
+
+6. **A failed fetch still loads what it already collected.** `_ingest_source`
+   catches the fetch exception and *then* runs the loader on whatever was
+   accumulated. This both avoids throwing away good data already paid for and
+   is what keeps the counter identity exact when a page dies mid-source.
+
+7. **`run_ingestion` takes two arguments beyond the specified signature**:
+   `world_config` (so the CLI can pass `--users` through to the generator,
+   which `world_seed` alone cannot express) and `sleep_fn` (so tests skip
+   backoff). Both are keyword-only with safe defaults.
+
+8. **`chaos` can kill a source outright.** Per-attempt failure probability is
+   ~41%, so 5 consecutive failures on a single page happens roughly 1% of the
+   time; with seed 42 it killed `campaigns` entirely in one trial, after which
+   every child record quarantined. That is the intended demonstration of
+   "one source failing does not stop the others" — but it makes chaos runs
+   mostly-quarantine, so do not benchmark throughput with it.
+
+9. **`"XYZ"` is an accepted currency.** The rule as specified is "3-letter
+   alphabetic code, uppercased", and `XYZ` satisfies it. Only `""`, `"US$"`
+   and `"999"` are rejected. If real ISO-4217 membership is wanted, that needs
+   an explicit allowlist — it is a deliberate gap, not an oversight.
+
+10. **Money never touches binary float.** `_parse_money` routes floats through
+    `Decimal(str(value))` (per Phase 3 gotcha #1) and quantizes to 2dp with
+    ROUND_HALF_UP, so the `NUMERIC(12,2)` columns never round silently.
+
+11. **`fetch_all_pages` reserves four keyword names** — `source`, `sleep_fn`,
+    `stats`, `max_attempts`. Everything else in `**kwargs` is forwarded to the
+    fetch function alongside `page`. Watch for collisions if an upstream ever
+    grows a parameter with one of those names.
+
+12. **Validation error messages name the *wire* field, not the model field**
+    (`campaign_id`, not `campaign_external_id`), because Pydantic reports the
+    alias. That is intentional: the reason sits next to the raw payload in
+    `quarantined_records`, so they should agree.

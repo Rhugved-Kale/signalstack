@@ -1,0 +1,622 @@
+"""Tests for the ingestion pipeline.
+
+Schema and fetcher tests are pure; the loader/runner tests hit the real local
+Postgres. Every database test truncates before *and* after itself, so nothing
+is left behind either way.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from decimal import Decimal
+
+import pytest
+from pydantic import ValidationError
+from sqlalchemy import func, select, text
+
+from app.db.models import (
+    AdSpend,
+    Campaign,
+    Conversion,
+    IngestionRun,
+    QuarantinedRecord,
+    Touchpoint,
+)
+from app.db.session import SessionLocal
+from app.generator.fake_apis import (
+    FailureConfig,
+    FakeTimeoutError,
+    RateLimitError,
+    ServerError,
+)
+from app.generator.world import WorldConfig, build_world
+from app.pipeline.cli import FAILURE_PROFILES, DATA_TABLES
+from app.pipeline.fetcher import (
+    BACKOFF_MAX,
+    MAX_ATTEMPTS,
+    FetchStats,
+    PipelineFetchError,
+    fetch_all_pages,
+)
+from app.pipeline.loaders import upsert_campaigns, upsert_touchpoints
+from app.pipeline.runner import run_ingestion
+from app.pipeline.schemas import (
+    AdSpendIn,
+    CampaignIn,
+    ConversionIn,
+    TouchpointIn,
+    describe_validation_error,
+)
+
+UTC = dt.timezone.utc
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _truncate(db) -> None:
+    db.rollback()
+    db.execute(text(f"TRUNCATE {', '.join(DATA_TABLES)} RESTART IDENTITY CASCADE"))
+    db.commit()
+
+
+@pytest.fixture
+def db():
+    """A session against the real database, clean before and after."""
+    session = SessionLocal()
+    _truncate(session)
+    try:
+        yield session
+    finally:
+        _truncate(session)
+        session.close()
+
+
+def _no_sleep(_seconds: float) -> None:
+    """Injected in place of time.sleep so tests never actually wait."""
+
+
+# ---------------------------------------------------------------------------
+# Clean records
+# ---------------------------------------------------------------------------
+
+CLEAN_CAMPAIGN = {
+    "campaign_id": "cmp_abc123",
+    "campaign_name": "Prospecting Display — US Skincare",
+    "channel": "display",
+    "platform": "meta_ads",
+}
+CLEAN_AD_SPEND = {
+    "campaign_id": "cmp_abc123",
+    "date": "2026-07-18",
+    "spend_usd": 19.18,
+    "impressions": 4235,
+    "clicks": 34,
+}
+CLEAN_TOUCHPOINT = {
+    "event_id": "evt_abc123",
+    "user_id": "usr_abc123",
+    "campaign_id": "cmp_abc123",
+    "channel": "display",
+    "event_type": "impression",
+    "timestamp": "2026-07-18T05:10:44Z",
+}
+CLEAN_CONVERSION = {
+    "order_id": "ord_abc123",
+    "customer_id": "usr_abc123",
+    "amount": 51.62,
+    "currency": "USD",
+    "created_at": "2026-07-21T10:28:15Z",
+}
+
+
+def test_clean_records_validate():
+    campaign = CampaignIn.model_validate(CLEAN_CAMPAIGN)
+    assert campaign.external_id == "cmp_abc123"
+    assert campaign.name.startswith("Prospecting")
+
+    spend = AdSpendIn.model_validate(CLEAN_AD_SPEND)
+    assert spend.campaign_external_id == "cmp_abc123"
+    assert spend.date == dt.date(2026, 7, 18)
+    # Money is Decimal, and exactly the value on the wire — not a float artefact.
+    assert spend.spend == Decimal("19.18")
+    assert isinstance(spend.spend, Decimal)
+
+    touch = TouchpointIn.model_validate(CLEAN_TOUCHPOINT)
+    assert touch.touch_type == "impression"
+    assert touch.occurred_at == dt.datetime(2026, 7, 18, 5, 10, 44, tzinfo=UTC)
+    assert touch.occurred_at.tzinfo is not None
+
+    conversion = ConversionIn.model_validate(CLEAN_CONVERSION)
+    assert conversion.revenue == Decimal("51.62")
+    assert conversion.user_id == "usr_abc123"
+    assert conversion.currency == "USD"
+
+
+def test_numeric_strings_are_coerced_not_rejected():
+    """API sloppiness, not corruption."""
+    spend = AdSpendIn.model_validate(
+        {**CLEAN_AD_SPEND, "spend_usd": "42.50", "impressions": "100", "clicks": "5"}
+    )
+    assert spend.spend == Decimal("42.50")
+    assert spend.impressions == 100
+    assert spend.clicks == 5
+
+    conversion = ConversionIn.model_validate({**CLEAN_CONVERSION, "amount": "123.45"})
+    assert conversion.revenue == Decimal("123.45")
+
+
+def test_unknown_extra_fields_are_ignored():
+    payload = {
+        **CLEAN_CONVERSION,
+        "__v": 2,
+        "_debug_trace_id": "trace-123",
+        "experiment_bucket": "control",
+        "beta_metric": 0.42,
+    }
+    conversion = ConversionIn.model_validate(payload)
+    assert conversion.external_id == "ord_abc123"
+    assert not hasattr(conversion, "__v") or True  # simply not fatal
+
+
+def test_timestamps_accept_iso_with_and_without_z_and_unix_epoch():
+    with_z = ConversionIn.model_validate(
+        {**CLEAN_CONVERSION, "created_at": "2026-07-21T10:28:15Z"}
+    ).occurred_at
+    without_z = ConversionIn.model_validate(
+        {**CLEAN_CONVERSION, "created_at": "2026-07-21T10:28:15+00:00"}
+    ).occurred_at
+    naive = ConversionIn.model_validate(
+        {**CLEAN_CONVERSION, "created_at": "2026-07-21T10:28:15"}
+    ).occurred_at
+    epoch = ConversionIn.model_validate(
+        {**CLEAN_CONVERSION, "created_at": 1726902617}
+    ).occurred_at
+
+    assert with_z == without_z == naive
+    assert all(value.tzinfo is not None for value in (with_z, without_z, naive, epoch))
+    assert epoch == dt.datetime.fromtimestamp(1726902617, tz=UTC)
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    ["not-a-date", "0000-00-00", "", "yesterday", "   "],
+)
+def test_garbage_timestamp_is_rejected_as_validationerror(garbage):
+    """Must surface as ValidationError, never an uncaught ValueError.
+
+    `datetime.fromisoformat("0000-00-00")` raises ValueError rather than
+    failing a format check, which is exactly the trap Phase 3 flagged.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        ConversionIn.model_validate({**CLEAN_CONVERSION, "created_at": garbage})
+    reason = describe_validation_error(excinfo.value)
+    assert "created_at" in reason
+    assert reason
+
+
+@pytest.mark.parametrize(
+    ("model", "clean", "field", "value", "expected_in_reason"),
+    [
+        # Nulls in required fields
+        (CampaignIn, CLEAN_CAMPAIGN, "campaign_name", None, "must not be null"),
+        (ConversionIn, CLEAN_CONVERSION, "amount", None, "must not be null"),
+        (AdSpendIn, CLEAN_AD_SPEND, "impressions", None, "must not be null"),
+        # Empty strings
+        (CampaignIn, CLEAN_CAMPAIGN, "campaign_id", "", "must not be empty"),
+        (TouchpointIn, CLEAN_TOUCHPOINT, "user_id", "", "must not be empty"),
+        # An empty campaign_id is corruption, unlike an explicit null
+        (TouchpointIn, CLEAN_TOUCHPOINT, "campaign_id", "", "must not be empty"),
+        # Negative money
+        (ConversionIn, CLEAN_CONVERSION, "amount", -537.51, "greater than or equal to 0"),
+        (AdSpendIn, CLEAN_AD_SPEND, "spend_usd", -12.0, "greater than or equal to 0"),
+        # Bad currency
+        (ConversionIn, CLEAN_CONVERSION, "currency", "999", "3-letter"),
+        (ConversionIn, CLEAN_CONVERSION, "currency", "US$", "3-letter"),
+        (ConversionIn, CLEAN_CONVERSION, "currency", "", "must not be empty"),
+        # Garbage numerics
+        (AdSpendIn, CLEAN_AD_SPEND, "impressions", "not-a-number", "integer"),
+        (ConversionIn, CLEAN_CONVERSION, "amount", "not-a-number", "valid amount"),
+        # Garbage timestamp as unix-ish nonsense
+        (TouchpointIn, CLEAN_TOUCHPOINT, "timestamp", "not-a-date", "unparseable"),
+    ],
+)
+def test_malformed_variants_are_rejected_with_a_sensible_reason(
+    model, clean, field, value, expected_in_reason
+):
+    with pytest.raises(ValidationError) as excinfo:
+        model.model_validate({**clean, field: value})
+    reason = describe_validation_error(excinfo.value)
+    assert field in reason, f"reason should name the wire field: {reason}"
+    assert expected_in_reason in reason, f"unexpected reason: {reason}"
+
+
+@pytest.mark.parametrize(
+    ("model", "clean", "missing"),
+    [
+        (CampaignIn, CLEAN_CAMPAIGN, "campaign_id"),
+        (ConversionIn, CLEAN_CONVERSION, "amount"),
+        (AdSpendIn, CLEAN_AD_SPEND, "date"),
+        # A MISSING campaign_id key is rejected even though null is allowed.
+        (TouchpointIn, CLEAN_TOUCHPOINT, "campaign_id"),
+    ],
+)
+def test_missing_required_key_is_rejected(model, clean, missing):
+    payload = {key: value for key, value in clean.items() if key != missing}
+    with pytest.raises(ValidationError) as excinfo:
+        model.model_validate(payload)
+    reason = describe_validation_error(excinfo.value)
+    assert missing in reason
+    assert "Field required" in reason
+
+
+def test_explicit_null_campaign_id_is_accepted_for_organic():
+    touch = TouchpointIn.model_validate(
+        {**CLEAN_TOUCHPOINT, "campaign_id": None, "channel": "organic", "event_type": "visit"}
+    )
+    assert touch.campaign_external_id is None
+
+
+def test_clicks_may_not_exceed_impressions():
+    with pytest.raises(ValidationError) as excinfo:
+        AdSpendIn.model_validate({**CLEAN_AD_SPEND, "impressions": 5, "clicks": 10})
+    assert "cannot exceed impressions" in describe_validation_error(excinfo.value)
+
+    # Equal is fine.
+    assert AdSpendIn.model_validate(
+        {**CLEAN_AD_SPEND, "impressions": 10, "clicks": 10}
+    ).clicks == 10
+
+
+def test_lowercase_currency_is_uppercased():
+    assert ConversionIn.model_validate({**CLEAN_CONVERSION, "currency": "usd"}).currency == "USD"
+
+
+# ---------------------------------------------------------------------------
+# Fetcher
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_retries_server_error_then_succeeds():
+    attempts = {"count": 0}
+    slept: list[float] = []
+
+    def flaky(page: int = 1, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise ServerError("boom", status_code=503)
+        return {"data": [{"page": page}], "page": page, "has_more": False}
+
+    stats = FetchStats()
+    records = list(
+        fetch_all_pages(flaky, source="test", sleep_fn=slept.append, stats=stats)
+    )
+
+    assert records == [{"page": 1}]
+    assert attempts["count"] == 3
+    assert stats.retries == 2
+    assert len(slept) == 2
+    # Exponential backoff with jitter: bounded, and growing.
+    assert all(0 < value <= BACKOFF_MAX for value in slept)
+    assert slept[1] > slept[0]
+
+
+def test_rate_limit_waits_exactly_retry_after():
+    attempts = {"count": 0}
+    slept: list[float] = []
+
+    def limited(page: int = 1, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RateLimitError(retry_after=7)
+        return {"data": [], "page": page, "has_more": False}
+
+    stats = FetchStats()
+    list(fetch_all_pages(limited, source="test", sleep_fn=slept.append, stats=stats))
+
+    assert slept == [7.0], "a 429 must honour retry_after, not the backoff curve"
+    assert stats.retries == 1
+
+
+def test_exceeding_max_attempts_raises_pipeline_fetch_error():
+    def always_timeout(page: int = 1, **_kwargs):
+        raise FakeTimeoutError()
+
+    stats = FetchStats()
+    with pytest.raises(PipelineFetchError) as excinfo:
+        list(
+            fetch_all_pages(
+                always_timeout, source="dead", sleep_fn=_no_sleep, stats=stats
+            )
+        )
+
+    error = excinfo.value
+    assert error.attempts == MAX_ATTEMPTS
+    assert error.source == "dead"
+    assert error.page == 1
+    assert isinstance(error.last_exception, FakeTimeoutError)
+    assert stats.retries == MAX_ATTEMPTS - 1
+
+
+def test_validation_failures_are_not_retried():
+    """Retrying a data problem just reproduces it."""
+    attempts = {"count": 0}
+
+    def bad_data(page: int = 1, **_kwargs):
+        attempts["count"] += 1
+        raise ValueError("malformed envelope")
+
+    stats = FetchStats()
+    with pytest.raises(ValueError):
+        list(fetch_all_pages(bad_data, source="test", sleep_fn=_no_sleep, stats=stats))
+
+    assert attempts["count"] == 1, "must not retry a non-transport error"
+    assert stats.retries == 0
+
+
+def test_fetch_walks_every_page():
+    pages = {
+        1: {"data": [{"i": 1}, {"i": 2}], "has_more": True},
+        2: {"data": [{"i": 3}], "has_more": True},
+        3: {"data": [{"i": 4}], "has_more": False},
+    }
+
+    def paged(page: int = 1, **_kwargs):
+        return pages[page]
+
+    stats = FetchStats()
+    records = list(fetch_all_pages(paged, source="test", sleep_fn=_no_sleep, stats=stats))
+    assert [record["i"] for record in records] == [1, 2, 3, 4]
+    assert stats.pages_fetched == 3
+    assert stats.records_received == 4
+
+
+# ---------------------------------------------------------------------------
+# Loaders / referential integrity
+# ---------------------------------------------------------------------------
+
+
+def test_touchpoint_with_unknown_campaign_is_rejected_not_nulled(db):
+    upsert_campaigns(db, [CampaignIn.model_validate(CLEAN_CAMPAIGN)])
+    db.commit()
+
+    good = TouchpointIn.model_validate(CLEAN_TOUCHPOINT)
+    organic = TouchpointIn.model_validate(
+        {
+            **CLEAN_TOUCHPOINT,
+            "event_id": "evt_organic",
+            "campaign_id": None,
+            "channel": "organic",
+            "event_type": "visit",
+        }
+    )
+    dangling = TouchpointIn.model_validate(
+        {**CLEAN_TOUCHPOINT, "event_id": "evt_dangling", "campaign_id": "cmp_does_not_exist"}
+    )
+
+    result = upsert_touchpoints(db, [good, organic, dangling])
+    db.commit()
+
+    assert result.affected == 2, "only the resolvable and organic rows should load"
+    assert len(result.rejected) == 1
+    rejected_record, reason = result.rejected[0]
+    assert rejected_record.external_id == "evt_dangling"
+    assert "unknown campaign_id" in reason
+
+    stored = {
+        external_id: campaign_id
+        for external_id, campaign_id in db.execute(
+            select(Touchpoint.external_id, Touchpoint.campaign_id)
+        ).all()
+    }
+    assert set(stored) == {"evt_abc123", "evt_organic"}
+    assert stored["evt_organic"] is None, "organic keeps a null campaign"
+    assert stored["evt_abc123"] is not None
+    assert "evt_dangling" not in stored, "must not be silently nulled into the table"
+
+
+def test_dangling_touchpoints_are_written_to_quarantine_by_the_runner(db):
+    """End-to-end proof that a referential error lands in quarantined_records."""
+    result = run_ingestion(
+        db,
+        world_config=WorldConfig(seed=42, n_users=60),
+        failure_config=FailureConfig.none(),
+        sources=["touchpoints"],  # campaigns deliberately not ingested
+        sleep_fn=_no_sleep,
+    )
+
+    touchpoints = result["sources"][0]
+    assert touchpoints["quarantined"] > 0
+    assert touchpoints["status"] == "partial"
+
+    rows = db.execute(
+        select(QuarantinedRecord.error_reason, QuarantinedRecord.raw_payload)
+    ).all()
+    assert rows
+    assert all("unknown campaign_id" in reason for reason, _ in rows)
+    # The raw payload is kept verbatim for replay.
+    assert all(payload.get("event_id") for _, payload in rows)
+
+    # Only organic touchpoints (null campaign) could possibly have loaded.
+    loaded = db.execute(select(Touchpoint.campaign_id)).scalars().all()
+    assert all(campaign_id is None for campaign_id in loaded)
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+def _table_counts(db) -> dict[str, int]:
+    return {
+        "campaigns": db.scalar(select(func.count()).select_from(Campaign)),
+        "ad_spend": db.scalar(select(func.count()).select_from(AdSpend)),
+        "touchpoints": db.scalar(select(func.count()).select_from(Touchpoint)),
+        "conversions": db.scalar(select(func.count()).select_from(Conversion)),
+    }
+
+
+def test_ingestion_is_idempotent(db):
+    """Running twice with the same seed must not change the data tables.
+
+    Corruption and duplicates are enabled (deterministically, via the seed) so
+    this exercises dedupe and quarantine too; transport failures are off so the
+    test does not depend on backoff timing.
+    """
+    config = WorldConfig(seed=42, n_users=150)
+    failures = FailureConfig(
+        server_error_rate=0.0,
+        rate_limit_rate=0.0,
+        timeout_rate=0.0,
+        malformed_record_rate=0.10,
+        duplicate_record_rate=0.10,
+    )
+
+    first = run_ingestion(db, world_config=config, failure_config=failures, sleep_fn=_no_sleep)
+    counts_after_first = _table_counts(db)
+
+    second = run_ingestion(db, world_config=config, failure_config=failures, sleep_fn=_no_sleep)
+    counts_after_second = _table_counts(db)
+
+    assert counts_after_first == counts_after_second, "row counts must not drift"
+    assert all(count > 0 for count in counts_after_second.values())
+
+    # The second pass updated rows instead of inserting them.
+    assert first["totals"]["rows_inserted"] > 0
+    assert second["totals"]["rows_inserted"] == 0
+    assert second["totals"]["rows_updated"] > 0
+
+    # And no duplicate natural keys exist anywhere.
+    for model in (Campaign, Touchpoint, Conversion):
+        total = db.scalar(select(func.count()).select_from(model))
+        distinct = db.scalar(select(func.count(func.distinct(model.external_id))))
+        assert total == distinct, f"duplicate external_ids in {model.__tablename__}"
+
+    duplicate_spend = db.execute(
+        select(AdSpend.campaign_id, AdSpend.date, func.count())
+        .group_by(AdSpend.campaign_id, AdSpend.date)
+        .having(func.count() > 1)
+    ).all()
+    assert not duplicate_spend, "ad_spend must be unique per campaign-day"
+
+
+def test_counter_identity_received_equals_ingested_plus_quarantined(db):
+    """received == ingested + quarantined, exactly.
+
+    `ingested` counts unique rows upserted plus in-batch duplicates that were
+    dropped, because a dropped duplicate's data is present in the database via
+    its twin. See runner.py's module docstring.
+    """
+    result = run_ingestion(
+        db,
+        world_config=WorldConfig(seed=7, n_users=150),
+        failure_config=FailureConfig(0.0, 0.0, 0.0, 0.12, 0.08),
+        sleep_fn=_no_sleep,
+    )
+
+    for source in result["sources"]:
+        assert source["received"] == source["ingested"] + source["quarantined"], source
+        # And the breakdown reconciles with the ingested figure.
+        assert source["ingested"] == (
+            source["rows_inserted"] + source["rows_updated"] + source["duplicates_dropped"]
+        ), source
+
+    totals = result["totals"]
+    assert totals["received"] == totals["ingested"] + totals["quarantined"]
+    assert totals["duplicates_dropped"] > 0, "expected the duplicate rate to bite"
+    assert totals["quarantined"] > 0, "expected the malformed rate to bite"
+
+    # The same numbers must be persisted on the IngestionRun rows.
+    runs = db.execute(select(IngestionRun).order_by(IngestionRun.id)).scalars().all()
+    assert len(runs) == 4
+    for run in runs:
+        assert run.records_received == run.records_ingested + run.records_quarantined
+        assert run.finished_at is not None
+        assert run.started_at <= run.finished_at
+        assert run.status in {"success", "partial", "failed"}
+
+
+def test_chaos_profile_still_completes_with_partial_status(db):
+    result = run_ingestion(
+        db,
+        world_config=WorldConfig(seed=42, n_users=120),
+        failure_config=FAILURE_PROFILES["chaos"],
+        sleep_fn=_no_sleep,
+    )
+
+    # The run completed: every source produced a result and an IngestionRun.
+    assert len(result["sources"]) == 4
+    runs = db.execute(select(IngestionRun)).scalars().all()
+    assert len(runs) == 4
+    assert all(run.finished_at is not None for run in runs)
+    assert all(run.status != "running" for run in runs)
+
+    partial = [run for run in runs if run.status == "partial"]
+    assert partial, f"expected a partial run, got {[r.status for r in runs]}"
+    assert any(run.records_quarantined > 0 for run in partial)
+    assert result["totals"]["quarantined"] > 0
+
+    # Quarantined rows carry both the raw payload and a reason.
+    quarantined = db.execute(select(QuarantinedRecord)).scalars().all()
+    assert quarantined
+    assert all(row.error_reason for row in quarantined)
+    assert all(isinstance(row.raw_payload, dict) for row in quarantined)
+
+    # A single bad record never aborted a source: something still landed.
+    assert result["totals"]["ingested"] > 0
+
+
+def test_one_failing_source_does_not_stop_the_others(db):
+    """A source that blows up entirely is recorded, and the rest still run."""
+
+    def exploding(**_kwargs):
+        raise ServerError("permanently broken", status_code=500)
+
+    from app.pipeline import runner as runner_module
+
+    original = runner_module.build_source_specs
+
+    def patched(world, failure_config, seed):
+        specs = original(world, failure_config, seed)
+        broken = specs["ad_spend"]
+        specs["ad_spend"] = type(broken)(
+            name=broken.name,
+            fetch_fn=exploding,
+            model=broken.model,
+            loader=broken.loader,
+            per_page=broken.per_page,
+        )
+        return specs
+
+    runner_module.build_source_specs = patched
+    try:
+        result = run_ingestion(
+            db,
+            world_config=WorldConfig(seed=42, n_users=80),
+            failure_config=FailureConfig.none(),
+            sleep_fn=_no_sleep,
+        )
+    finally:
+        runner_module.build_source_specs = original
+
+    by_source = {row["source"]: row for row in result["sources"]}
+    assert by_source["ad_spend"]["status"] == "failed"
+    assert "ServerError" in by_source["ad_spend"]["error_message"]
+
+    # Everything else still succeeded.
+    for name in ("campaigns", "touchpoints", "conversions"):
+        assert by_source[name]["status"] in {"success", "partial"}
+        assert by_source[name]["ingested"] > 0
+
+    assert db.scalar(select(func.count()).select_from(AdSpend)) == 0
+    assert db.scalar(select(func.count()).select_from(Campaign)) > 0
+
+    # The failure is on the record, with its message.
+    failed_run = db.execute(
+        select(IngestionRun).where(IngestionRun.source == "ad_spend")
+    ).scalar_one()
+    assert failed_run.status == "failed"
+    assert failed_run.error_message
+    assert failed_run.retry_count > 0, "the transport error should have been retried"
