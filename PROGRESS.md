@@ -1075,3 +1075,112 @@ to the cent: \$125,958.67 total = \$124,804.39 attributed + \$1,154.28 across
    ingestion could in principle apply a drifting boundary. Irrelevant at
    current runtimes (seconds), but if runs ever take hours, pass
    `context={"now": run_started_at}` from `runner.py` for a stable boundary.
+
+## Phase 7 — React dashboard
+
+Date: 2026-09-14
+
+Scope: `frontend/` only. No backend file was touched. One page, no router, no
+state library, no UI kit — recharts is the single dependency added.
+
+### Component structure
+
+```
+frontend/src/
+  api.js              # every fetch; the only place that knows the API URL
+  selectors.js        # pure derivations over API responses
+  theme.js            # the two colour scales, defined once
+  format.js           # money / count / roas / date formatters
+  hooks/
+    useApi.js         # loading / error / refresh-without-flash
+    usePrefersDark.js # OS colour scheme, for the dark chart steps
+  App.jsx             # layout, model state, refreshKey, page-level error gate
+  components/
+    primitives.jsx        # Card, Skeleton, InlineError, EmptyState, Badge
+    ModelSelector.jsx     # the one filter row, above everything it scopes
+    HeroStats.jsx         # §1 stat cards + the disagreement spotlight
+    ChannelPerformance.jsx# §2 horizontal bars + table
+    ModelComparison.jsx   # §3 grouped bars + swing table
+    JourneyExplorer.jsx    # §4 left: expandable customer paths
+    PipelineHealth.jsx    # §4 right: runs, quarantine, row counts
+    RunPipeline.jsx       # confirm → POST → poll → refresh
+```
+
+### The API client
+
+`api.js` reads `VITE_API_URL` once and exports one function per endpoint.
+Everything goes through a single `request()` that normalises failures into an
+`ApiError` with `.status` and `.isNetworkError`, so callers can tell "the
+backend is down" (status 0) from "that model does not exist" (422) without
+string matching. No component contains a URL.
+
+`useApi(fetcher, deps)` owns the three states. On a refetch it **keeps the
+previous data** and sets `isRefreshing`, so sections dim instead of collapsing
+into skeletons — no layout jump when the model changes. Each call gets an
+`AbortController`, and aborted requests are swallowed rather than rendered as
+errors.
+
+One `refreshKey` in `App` is the refetch-everything switch: the pipeline button
+bumps it and all six calls re-run.
+
+### Colour
+
+Two categorical scales in `theme.js`, both taken in fixed slot order from a
+palette validated with the data-viz skill's checker (worst adjacent CVD ΔE 9.1
+light / 8.4 dark; normal-vision ΔE 19.6 / 19.3; all slots inside the lightness
+and chroma bands):
+
+* **Channel colours** — identity. A channel keeps its hue in every chart,
+  table swatch and journey chain. Bars re-order when the model changes; the
+  colours do not follow rank.
+* **Model colours** — used only in §3, where the *series* is the model and the
+  channel is carried by the axis label instead. Colouring those five bars by
+  channel would make the models indistinguishable.
+
+Three light-mode hues fall under 3:1 contrast against the surface, so the
+validator's relief rule applies: every chart ships a table view and direct
+value labels. Dark mode uses separately-stepped hues, not dimmed light ones.
+
+### Gotchas
+
+1. **`/api/journeys` returns only *credited* touchpoints, so single-touch
+   models lose the path.** Under `last_touch` every journey came back with one
+   touchpoint and the chain collapsed to a single node — the panel's whole
+   point is the path. Fixed in the frontend (the backend was off-limits, and
+   the response is not wrong): for single-touch models the path is sourced
+   from `linear`, which credits every touchpoint and therefore describes the
+   full journey, and the selected model's credits are overlaid on it by
+   `(conversion_id, touchpoint_id)`. Uncredited touchpoints render as 0%,
+   which turns out to be the clearest demonstration on the page — expanding a
+   `last_touch` journey shows 0%, 0%, 0%, 100%. Both fetches use `limit=100`
+   so the overlay finds its matches; see `buildJourneyList`.
+
+2. **An inline `<span>` has no height.** `.credit-bar-fill` was
+   `display: inline` with `height: 100%`, so every credit bar rendered at 0px
+   — invisible, with no error anywhere. Caught by inspecting computed styles
+   in the browser, not by the build. Both the bar and its track are now
+   explicitly `display: block`.
+
+3. **`ERR_ABORTED` in the network log is expected in dev.** React 19's
+   StrictMode mounts effects twice, so `useApi`'s cleanup aborts the first
+   request of each pair; every abort is immediately followed by a 200. It does
+   not happen in a production build.
+
+4. **The pipeline button is deterministic, so "the numbers update" is subtle.**
+   Seed 42 rebuilds byte-identical data, so after a run the figures are the
+   same — the refetch genuinely fires (visible in the network log) but nothing
+   appears to change. That is the generator working as designed; change the
+   seed in `RunPipeline.jsx`'s `DEMO_PAYLOAD` to see the numbers move.
+
+5. **The 409 path needs an external trigger to see.** The button disables
+   itself while a run is in flight, so the "already running" case only arises
+   from another tab or client. Verified by starting a run with `curl` and then
+   clicking the button; it shows an informational banner, not an error.
+
+6. **`recharts` is ~610 kB raw / 181 kB gzipped**, which trips Vite's 500 kB
+   chunk advisory. Left as one chunk on purpose: the charts are needed for
+   first paint, so splitting them would move bytes without improving the load.
+
+7. **Bundle-level date handling.** All dates are formatted through
+   `format.js`; nothing calls `toLocaleString` inline, so the `—` fallback for
+   null/NaN is applied in exactly one place per type.

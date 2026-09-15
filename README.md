@@ -3,7 +3,7 @@
 An ad performance attribution pipeline: it ingests campaign and revenue data, runs
 multi-touch attribution, and serves the results to a dashboard.
 
-> Status: Phase 6 — HTTP API. No frontend dashboard yet.
+> Status: Phase 7 — complete. Pipeline, attribution engine, API and dashboard.
 
 ## Folder structure
 
@@ -50,12 +50,76 @@ signalstack/
       test_api.py        # API tests (TestClient)
     requirements.txt
     .env.example
-  frontend/              # Vite + React (JavaScript)
+  frontend/              # Vite + React dashboard (JavaScript)
+    src/
+      api.js             # every API call
+      theme.js           # channel + model colour scales
+      format.js          # money / count / ROAS formatters
+      selectors.js       # pure derivations over API responses
+      hooks/             # useApi, usePrefersDark
+      components/        # one component per dashboard section
   docker-compose.yml     # postgres:16
   .gitignore
   README.md
   PROGRESS.md            # running log across phases
 ```
+
+## Run the whole thing
+
+Three terminals, in this order.
+
+**1. Postgres**
+
+```bash
+docker compose up -d
+```
+
+**2. API** — http://localhost:8000, interactive docs at `/docs`
+
+```bash
+cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
+```
+
+**3. Dashboard** — http://localhost:5173
+
+```bash
+cd frontend && npm run dev
+```
+
+If the database is empty, populate it — either click **Run pipeline** in the
+dashboard header, or from the command line:
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000 --replay
+```
+
+```bash
+cd backend && .venv/bin/python -m app.attribution.cli --rebuild
+```
+
+> `pytest` truncates the data tables, so re-run those two commands after a test
+> run.
+
+## Dashboard
+
+A single page, four sections, no router:
+
+1. **Hero stats** — attributed revenue, spend, blended ROAS, conversions and
+   touchpoints, plus a spotlight on the largest model disagreement.
+2. **Channel performance** — attributed revenue per channel for the selected
+   model, as animated bars and a table. Bars re-order when the model changes;
+   each channel keeps its colour.
+3. **Model comparison** — five bars per channel, one per model, with a swing
+   column. The centrepiece: display is worth $57,931 under first-touch and
+   $2,221 under last-touch on the same data.
+4. **Journeys & pipeline** — expandable customer paths showing per-touch
+   credit, beside ingestion runs and quarantine reasons.
+
+The header's **Run pipeline** button rebuilds the entire dataset (generate →
+ingest → replay → attribute) in the background, streaming per-stage progress,
+then refetches every section.
+
+Set the API location with `VITE_API_URL` in `frontend/.env`.
 
 ## Local setup
 
