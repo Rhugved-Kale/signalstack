@@ -20,6 +20,7 @@ from app.db.models import QuarantinedRecord
 from app.db.session import SessionLocal
 from app.generator.fake_apis import FailureConfig
 from app.generator.world import WorldConfig
+from app.pipeline.replay import replay_quarantine
 from app.pipeline.runner import run_ingestion
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,39 @@ def print_top_quarantine_reasons(
         print(f"  {count:>6,}  {source:<12} {display}")
 
 
+def print_replay_table(result: dict[str, Any]) -> None:
+    header = f"{'source':<14}{'before':>10}{'recovered':>11}{'remaining':>11}"
+    print()
+    print("Quarantine replay")
+    print(header)
+    print("-" * len(header))
+    for source, counts in result["sources"].items():
+        print(
+            f"{source:<14}{counts['attempted']:>10,}"
+            f"{counts['recovered']:>11,}{counts['still_quarantined']:>11,}"
+        )
+    totals = result["totals"]
+    print("-" * len(header))
+    print(
+        f"{'TOTAL':<14}{totals['attempted']:>10,}"
+        f"{totals['recovered']:>11,}{totals['still_quarantined']:>11,}"
+    )
+    recovered_pct = (
+        100 * totals["recovered"] / totals["attempted"] if totals["attempted"] else 0.0
+    )
+    print(
+        f"\n  parent campaigns recovered by re-fetch: "
+        f"{result['parent_campaigns_recovered']}"
+    )
+    print(
+        f"  rounds run={result['rounds']}  retries={totals['retries']}  "
+        f"status={result['status']}  recovered={recovered_pct:.1f}%  "
+        f"duration={result['duration_seconds']:.2f}s"
+    )
+    if result.get("error_message"):
+        print(f"  error: {result['error_message']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.pipeline.cli",
@@ -162,13 +196,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="TRUNCATE all data tables before ingesting",
     )
     parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="Replay quarantined records after the main ingestion",
+    )
+    parser.add_argument(
+        "--replay-only",
+        action="store_true",
+        help="Replay existing quarantine only; skip fresh ingestion",
+    )
+    parser.add_argument(
         "--quiet", action="store_true", help="Suppress per-source INFO logging"
     )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.replay_only and args.reset:
+        parser.error(
+            "--reset with --replay-only would truncate the very quarantine "
+            "you are trying to replay"
+        )
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
         format="%(levelname)-7s %(name)s: %(message)s",
@@ -183,18 +233,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Resetting {len(DATA_TABLES)} data tables...")
             reset_data(db)
 
-        print(
-            f"Ingesting seed={args.seed} users={args.users:,} "
-            f"failure-profile={args.failure_profile}"
-        )
-        result = run_ingestion(
-            db, world_config=world_config, failure_config=failure_config
-        )
-        print_run_table(result)
-        print_top_quarantine_reasons(db, result["ingestion_run_ids"])
-        print()
+        any_failed = False
 
-        any_failed = any(row["status"] == "failed" for row in result["sources"])
+        if not args.replay_only:
+            print(
+                f"Ingesting seed={args.seed} users={args.users:,} "
+                f"failure-profile={args.failure_profile}"
+            )
+            result = run_ingestion(
+                db, world_config=world_config, failure_config=failure_config
+            )
+            print_run_table(result)
+            print_top_quarantine_reasons(db, result["ingestion_run_ids"])
+            print()
+            any_failed = any(row["status"] == "failed" for row in result["sources"])
+
+        if args.replay or args.replay_only:
+            replay_result = replay_quarantine(
+                db, world_config=world_config, failure_config=failure_config
+            )
+            print_replay_table(replay_result)
+            print()
+            if replay_result["status"] == "failed":
+                any_failed = True
+
         return 1 if any_failed else 0
     finally:
         db.close()

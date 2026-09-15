@@ -3,7 +3,8 @@
 An ad performance attribution pipeline: it ingests campaign and revenue data, runs
 multi-touch attribution, and serves the results to a dashboard.
 
-> Status: Phase 4 — ingestion pipeline. No attribution or dashboard logic yet.
+> Status: Phase 4.5 — ingestion pipeline with quarantine replay. No
+> attribution or dashboard logic yet.
 
 ## Folder structure
 
@@ -28,6 +29,7 @@ signalstack/
         fetcher.py       # pagination + retry policy
         loaders.py       # idempotent batch upserts
         runner.py        # per-source orchestration
+        replay.py        # dependency-ordered quarantine replay
         cli.py           # ingestion CLI
       attribution/       # (empty) multi-touch attribution logic
     alembic/             # migration environment
@@ -219,8 +221,20 @@ Flags: `--seed`, `--users`, `--failure-profile {none,normal,chaos}`, `--reset`
 leaves the data tables unchanged — the upserts are keyed on the natural keys
 from the Phase 2 schema.
 
+Replay quarantined records in dependency order — re-fetching parent campaigns
+so orphaned children can load:
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000 --replay
+```
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --replay-only
+```
+
 See PROGRESS.md → "Phase 4" for the retry policy, what gets quarantined and
-why, and the `received == ingested + quarantined` counter identity.
+why, and the `received == ingested + quarantined` counter identity; "Phase 4.5"
+covers replay and the currency allowlist.
 
 ## Configuration
 

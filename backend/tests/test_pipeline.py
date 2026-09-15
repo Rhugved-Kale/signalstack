@@ -39,8 +39,10 @@ from app.pipeline.fetcher import (
     fetch_all_pages,
 )
 from app.pipeline.loaders import upsert_campaigns, upsert_touchpoints
+from app.pipeline.replay import replay_quarantine
 from app.pipeline.runner import run_ingestion
 from app.pipeline.schemas import (
+    SUPPORTED_CURRENCIES,
     AdSpendIn,
     CampaignIn,
     ConversionIn,
@@ -213,8 +215,10 @@ def test_garbage_timestamp_is_rejected_as_validationerror(garbage):
         (ConversionIn, CLEAN_CONVERSION, "amount", -537.51, "greater than or equal to 0"),
         (AdSpendIn, CLEAN_AD_SPEND, "spend_usd", -12.0, "greater than or equal to 0"),
         # Bad currency
-        (ConversionIn, CLEAN_CONVERSION, "currency", "999", "3-letter"),
-        (ConversionIn, CLEAN_CONVERSION, "currency", "US$", "3-letter"),
+        (ConversionIn, CLEAN_CONVERSION, "currency", "999", "not a supported currency"),
+        (ConversionIn, CLEAN_CONVERSION, "currency", "US$", "not a supported currency"),
+        # Shape-valid but semantically unsupported.
+        (ConversionIn, CLEAN_CONVERSION, "currency", "XYZ", "not a supported currency"),
         (ConversionIn, CLEAN_CONVERSION, "currency", "", "must not be empty"),
         # Garbage numerics
         (AdSpendIn, CLEAN_AD_SPEND, "impressions", "not-a-number", "integer"),
@@ -272,6 +276,24 @@ def test_clicks_may_not_exceed_impressions():
 
 def test_lowercase_currency_is_uppercased():
     assert ConversionIn.model_validate({**CLEAN_CONVERSION, "currency": "usd"}).currency == "USD"
+
+
+def test_currency_must_be_in_the_supported_allowlist():
+    """A well-formed code is not automatically a supported one."""
+    # "XYZ" is three alphabetic characters and still rejected.
+    with pytest.raises(ValidationError) as excinfo:
+        ConversionIn.model_validate({**CLEAN_CONVERSION, "currency": "XYZ"})
+    reason = describe_validation_error(excinfo.value)
+    assert reason == "currency: 'XYZ' is not a supported currency code"
+
+    # Every allowlisted code is accepted, in either case.
+    for code in SUPPORTED_CURRENCIES:
+        assert (
+            ConversionIn.model_validate(
+                {**CLEAN_CONVERSION, "currency": code.lower()}
+            ).currency
+            == code
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -620,3 +642,248 @@ def test_one_failing_source_does_not_stop_the_others(db):
     assert failed_run.status == "failed"
     assert failed_run.error_message
     assert failed_run.retry_count > 0, "the transport error should have been retried"
+
+
+# ---------------------------------------------------------------------------
+# Quarantine replay (Phase 4.5)
+# ---------------------------------------------------------------------------
+
+
+def test_orphaned_touchpoint_is_recovered_once_its_parent_exists(db):
+    """The Phase 4 cascade, repaired.
+
+    Ingest touchpoints with no campaigns present, so every non-organic
+    touchpoint is quarantined purely for being an orphan. Replay re-fetches
+    the parents and the orphans then load cleanly.
+    """
+    config = WorldConfig(seed=42, n_users=80)
+
+    ingest = run_ingestion(
+        db,
+        world_config=config,
+        failure_config=FailureConfig.none(),
+        sources=["touchpoints"],
+        sleep_fn=_no_sleep,
+    )
+    orphaned = ingest["sources"][0]["quarantined"]
+    assert orphaned > 0, "expected orphans with no campaigns loaded"
+
+    quarantined_before = (
+        db.execute(
+            select(QuarantinedRecord.raw_payload).where(
+                QuarantinedRecord.source == "touchpoints"
+            )
+        )
+        .scalars()
+        .all()
+    )
+    orphan_event_ids = {payload["event_id"] for payload in quarantined_before}
+    assert len(orphan_event_ids) == orphaned
+    assert db.scalar(select(func.count()).select_from(Campaign)) == 0
+
+    result = replay_quarantine(
+        db,
+        world_config=config,
+        failure_config=FailureConfig.none(),
+        sleep_fn=_no_sleep,
+    )
+
+    # The parents were re-fetched and the orphans recovered.
+    assert result["parent_campaigns_recovered"] > 0
+    assert result["sources"]["touchpoints"]["recovered"] == orphaned
+    assert result["sources"]["touchpoints"]["still_quarantined"] == 0
+    assert result["status"] == "success"
+
+    # They are gone from quarantine...
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(QuarantinedRecord)
+            .where(QuarantinedRecord.source == "touchpoints")
+        )
+        == 0
+    )
+
+    # ...and present in the real table, with a resolved campaign.
+    stored = {
+        external_id: campaign_id
+        for external_id, campaign_id in db.execute(
+            select(Touchpoint.external_id, Touchpoint.campaign_id).where(
+                Touchpoint.external_id.in_(orphan_event_ids)
+            )
+        ).all()
+    }
+    assert set(stored) == orphan_event_ids
+    assert all(campaign_id is not None for campaign_id in stored.values())
+
+
+def test_genuinely_malformed_record_is_not_recovered(db):
+    """A garbage timestamp cannot be repaired by replay; it must stay put."""
+    run = IngestionRun(
+        source="touchpoints", started_at=dt.datetime.now(UTC), status="success"
+    )
+    db.add(run)
+    db.commit()
+
+    bad_payload = {**CLEAN_TOUCHPOINT, "campaign_id": None, "timestamp": "not-a-date"}
+    db.add(
+        QuarantinedRecord(
+            ingestion_run_id=run.id,
+            source="touchpoints",
+            raw_payload=bad_payload,
+            error_reason="timestamp: unparseable timestamp 'not-a-date'",
+        )
+    )
+    db.commit()
+
+    result = replay_quarantine(
+        db,
+        world_config=WorldConfig(seed=42, n_users=40),
+        failure_config=FailureConfig.none(),
+        sleep_fn=_no_sleep,
+    )
+
+    assert result["sources"]["touchpoints"]["recovered"] == 0
+    assert result["sources"]["touchpoints"]["still_quarantined"] == 1
+    assert result["status"] == "partial"
+
+    survivor = db.execute(
+        select(QuarantinedRecord).where(QuarantinedRecord.source == "touchpoints")
+    ).scalar_one()
+    assert survivor.error_reason, "error_reason must stay populated"
+    assert "timestamp" in survivor.error_reason
+    assert "unparseable" in survivor.error_reason
+    # The raw payload is untouched, so it can still be inspected or replayed.
+    assert survivor.raw_payload == bad_payload
+    # And nothing was written to the real table.
+    assert db.scalar(select(func.count()).select_from(Touchpoint)) == 0
+
+
+def test_replay_is_idempotent(db):
+    config = WorldConfig(seed=42, n_users=150)
+    failures = FailureConfig(
+        server_error_rate=0.0,
+        rate_limit_rate=0.0,
+        timeout_rate=0.0,
+        malformed_record_rate=0.12,
+        duplicate_record_rate=0.05,
+    )
+    run_ingestion(db, world_config=config, failure_config=failures, sleep_fn=_no_sleep)
+
+    first = replay_quarantine(
+        db, world_config=config, failure_config=failures, sleep_fn=_no_sleep
+    )
+    counts_after_first = _table_counts(db)
+    surviving_ids_first = set(
+        db.execute(select(QuarantinedRecord.id)).scalars().all()
+    )
+
+    second = replay_quarantine(
+        db, world_config=config, failure_config=failures, sleep_fn=_no_sleep
+    )
+    counts_after_second = _table_counts(db)
+    surviving_ids_second = set(
+        db.execute(select(QuarantinedRecord.id)).scalars().all()
+    )
+
+    assert counts_after_first == counts_after_second, "data tables must not drift"
+    assert second["totals"]["recovered"] == 0, "nothing left to recover"
+    # Deleted quarantine rows stay deleted; no row is resurrected.
+    assert surviving_ids_second == surviving_ids_first
+    assert surviving_ids_second <= surviving_ids_first
+
+    # Still no duplicate natural keys after a replay.
+    for model in (Campaign, Touchpoint, Conversion):
+        total = db.scalar(select(func.count()).select_from(model))
+        distinct = db.scalar(select(func.count(func.distinct(model.external_id))))
+        assert total == distinct, f"duplicate external_ids in {model.__tablename__}"
+
+    # The second replay stops after one unproductive round.
+    assert second["rounds"] == 1
+
+
+def test_replay_records_an_ingestion_run_with_source_replay(db):
+    run_ingestion(
+        db,
+        world_config=WorldConfig(seed=42, n_users=60),
+        failure_config=FailureConfig(0.0, 0.0, 0.0, 0.15, 0.0),
+        sleep_fn=_no_sleep,
+    )
+    result = replay_quarantine(
+        db,
+        world_config=WorldConfig(seed=42, n_users=60),
+        failure_config=FailureConfig.none(),
+        sleep_fn=_no_sleep,
+    )
+
+    replay_run = db.execute(
+        select(IngestionRun).where(IngestionRun.source == "replay")
+    ).scalar_one()
+
+    assert replay_run.id == result["replay_run_id"]
+    assert replay_run.status in {"success", "partial", "failed"}
+    assert replay_run.finished_at is not None
+    assert replay_run.started_at <= replay_run.finished_at
+    assert replay_run.records_received == result["totals"]["attempted"]
+    assert replay_run.records_ingested == result["totals"]["recovered"]
+    assert replay_run.records_quarantined == result["totals"]["still_quarantined"]
+    # The replay run keeps the same counter identity as an ingestion run.
+    assert (
+        replay_run.records_received
+        == replay_run.records_ingested + replay_run.records_quarantined
+    )
+
+
+def test_replay_processes_sources_in_dependency_order(db):
+    """Campaigns must be repaired before their children are retried."""
+    from app.pipeline.replay import REPLAY_ORDER
+
+    assert REPLAY_ORDER.index("campaigns") == 0
+    assert REPLAY_ORDER.index("campaigns") < REPLAY_ORDER.index("ad_spend")
+    assert REPLAY_ORDER.index("campaigns") < REPLAY_ORDER.index("touchpoints")
+
+    # Requesting only children still repairs the parents.
+    run_ingestion(
+        db,
+        world_config=WorldConfig(seed=42, n_users=60),
+        failure_config=FailureConfig.none(),
+        sources=["touchpoints"],
+        sleep_fn=_no_sleep,
+    )
+    result = replay_quarantine(
+        db,
+        sources=["touchpoints"],
+        world_config=WorldConfig(seed=42, n_users=60),
+        failure_config=FailureConfig.none(),
+        sleep_fn=_no_sleep,
+    )
+    assert result["parent_campaigns_recovered"] > 0
+    assert set(result["sources"]) == {"touchpoints"}
+    assert result["sources"]["touchpoints"]["still_quarantined"] == 0
+
+
+def test_replay_with_fetch_parents_disabled_recovers_nothing(db):
+    """Without the parent re-fetch there is nothing to repair an orphan with."""
+    config = WorldConfig(seed=42, n_users=60)
+    run_ingestion(
+        db,
+        world_config=config,
+        failure_config=FailureConfig.none(),
+        sources=["touchpoints"],
+        sleep_fn=_no_sleep,
+    )
+    before = db.scalar(select(func.count()).select_from(QuarantinedRecord))
+    assert before > 0
+
+    result = replay_quarantine(
+        db,
+        world_config=config,
+        failure_config=FailureConfig.none(),
+        fetch_parents=False,
+        sleep_fn=_no_sleep,
+    )
+
+    assert result["parent_campaigns_recovered"] == 0
+    assert result["totals"]["recovered"] == 0
+    assert result["totals"]["still_quarantined"] == before
+    assert db.scalar(select(func.count()).select_from(Campaign)) == 0

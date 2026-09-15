@@ -34,6 +34,28 @@ UTC = dt.timezone.utc
 # never has to round silently behind us.
 MONEY_EXPONENT = Decimal("0.01")
 
+# Currencies this pipeline is prepared to handle. This is a *semantic* check,
+# not a shape check: "XYZ" is a perfectly well-formed three-letter code and is
+# still not money we can attribute revenue in. Widening the pipeline to a new
+# currency is a deliberate act (FX handling, reporting), so it belongs in an
+# explicit list rather than a regex.
+SUPPORTED_CURRENCIES = frozenset(
+    {
+        "USD",
+        "EUR",
+        "GBP",
+        "CAD",
+        "AUD",
+        "JPY",
+        "CHF",
+        "SEK",
+        "NOK",
+        "DKK",
+        "NZD",
+        "MXN",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Reusable coercions
@@ -162,12 +184,15 @@ def _parse_money(value: Any) -> Decimal:
 
 
 def _parse_currency(value: Any) -> str:
-    """A 3-letter alphabetic code, normalised to upper case."""
+    """A supported currency code, normalised to upper case.
+
+    Uppercases first, so "usd" is accepted and stored as "USD", then checks
+    membership in `SUPPORTED_CURRENCIES`. The rejection names the offending
+    value so the reason stored alongside the raw payload is self-explanatory.
+    """
     code = _require_non_empty_str(value).upper()
-    if len(code) != 3 or not code.isalpha():
-        raise ValueError(
-            f"must be a 3-letter alphabetic currency code, got {value!r}"
-        )
+    if code not in SUPPORTED_CURRENCIES:
+        raise ValueError(f"{value!r} is not a supported currency code")
     return code
 
 

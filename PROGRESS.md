@@ -546,3 +546,142 @@ were byte-identical before and after (campaigns 11, ad_spend 633, touchpoints
     (`campaign_id`, not `campaign_external_id`), because Pydantic reports the
     alias. That is intentional: the reason sits next to the raw payload in
     `quarantined_records`, so they should agree.
+
+## Phase 4.5 — Quarantine replay
+
+Date: 2026-09-14
+
+Two targeted changes: a semantic currency allowlist, and dependency-ordered
+replay of quarantined records. No attribution logic, endpoints or frontend.
+
+### Change 1 — ISO-4217 currency allowlist
+
+`schemas.py` now checks membership in `SUPPORTED_CURRENCIES` (USD, EUR, GBP,
+CAD, AUD, JPY, CHF, SEK, NOK, DKK, NZD, MXN) instead of "three alphabetic
+characters". Values are uppercased first, so `"usd"` is still accepted and
+stored as `"USD"`. Rejections name the value:
+
+    currency: 'XYZ' is not a supported currency code
+
+**Why shape-validity and semantic-validity are different things.** The old rule
+asked "does this *look* like a currency code?" — and `"XYZ"` passes that test
+perfectly: three letters, all alphabetic. It is also not money this pipeline
+can do anything with. A shape check can only reject malformed input; it cannot
+reject well-formed input that the system has no meaning for. Accepting `"XYZ"`
+would have written a row whose `revenue` is denominated in nothing, and every
+downstream sum over mixed currencies would be silently wrong — the worst class
+of bug, because it produces plausible numbers. Supporting a new currency is a
+deliberate act (FX rates, reporting, reconciliation), so the list of currencies
+we can actually handle belongs in code as an explicit constant, not implied by
+a regex. Phase 4 gotcha #9 flagged this as a deliberate gap; it is now closed.
+
+Note: in the seed-42 / 3,000-user run no `"XYZ"` corruption happened to land on
+a conversion record, so the allowlist did not change that run's counts. Its
+effect is covered by a unit test asserting the exact rejection string, plus
+tests that every allowlisted code is accepted in either case.
+
+### Change 2 — `pipeline/replay.py`
+
+    replay_quarantine(db, *, sources=None, max_rounds=3, fetch_parents=True,
+                      world_seed=42, world_config=None, failure_config=None,
+                      sleep_fn=None) -> dict
+
+Processes quarantine in dependency order — `campaigns`, `ad_spend`,
+`touchpoints`, `conversions` — reusing the existing schemas, loaders and
+fetcher rather than reimplementing any of them.
+
+The insight it exploits: a quarantined *campaign*'s stored payload is corrupt,
+so re-validating it will fail forever. But the entity it describes is still
+fetchable, and the upstream corrupts randomly per call. So:
+
+1. **Re-fetch the parents.** `_refetch_missing_campaigns` pulls the campaigns
+   source through the normal retry path, validates, and upserts only campaigns
+   that were *missing* from the database — so the returned count means exactly
+   "parents this repaired" and existing rows are untouched.
+2. **Re-drive the children.** Their payloads were never corrupt; they were
+   merely orphaned. With the parent present they load cleanly.
+3. **Recovered rows are deleted** from `quarantined_records`; rows that fail
+   again **stay**, with `error_reason` refreshed to the current failure and
+   `raw_payload` left untouched.
+4. Loops up to `max_rounds`, stopping early as soon as a round recovers
+   nothing.
+5. Records the whole operation as an `IngestionRun` with source `"replay"`,
+   preserving the `received == ingested + quarantined` identity.
+
+### Results (seed 42, 3,000 users)
+
+| source | quarantined | recovered | remaining |
+| --- | --- | --- | --- |
+| campaigns | 1 | 1 | 0 |
+| ad_spend | 87 | 58 | 29 |
+| touchpoints | 804 | **462** | 342 |
+| conversions | 32 | 0 | 32 |
+| **TOTAL** | **924** | **521 (56.4%)** | **403** |
+
+Re-fetching **one** campaign (`cmp_05da846a`, quarantined because
+`campaign_name` was dropped) recovered **all 462 orphaned touchpoints and all
+58 orphaned ad_spend rows** — exactly the cascade Phase 4 gotcha #1 predicted,
+now repaired. Row counts moved campaigns 11 → 12, touchpoints 7,417 → 7,879,
+ad_spend 633 → 691, and zero `unknown campaign_id` rows remain. The surviving
+403 are genuinely malformed (dropped required fields, garbage timestamps, empty
+ids) and are not recoverable by replay.
+
+### CLI
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --reset --users 3000 --replay
+```
+
+```bash
+cd backend && .venv/bin/python -m app.pipeline.cli --replay-only
+```
+
+`--replay` runs replay after ingestion; `--replay-only` replays existing
+quarantine with no fresh ingestion. Both print a before/recovered/remaining
+table. `--reset --replay-only` is refused by the parser, since it would
+truncate the quarantine you are asking it to replay.
+
+### Notes / gotchas for future sessions
+
+1. **Replay MUST fetch with a different RNG seed than the ingestion did.**
+   The fake APIs are deterministic per seed, so re-fetching with the
+   ingestion's own seed reproduces byte-identical corruption and recovers
+   *nothing*. `replay.py` offsets the seed by
+   `REPLAY_SEED_BASE + round * REPLAY_SEED_STRIDE` (1000 + round*17), which is
+   different from ingestion but still deterministic — so tests stay
+   reproducible. This is the single most important detail in the module; if
+   replay ever "mysteriously recovers 0 parents", check this first.
+
+2. **A quarantined campaign is recovered by identity, not by re-validation.**
+   Its stored payload stays invalid forever. Replay instead checks whether the
+   payload's `campaign_id` now exists in `campaigns` (having been repaired by
+   the re-fetch) and, if so, deletes the obsolete quarantine row. A campaign
+   whose *`campaign_id` itself* was the corrupted field cannot be identified
+   this way and will correctly remain quarantined — there is genuinely no way
+   to know which campaign it was.
+
+3. **`--users` does not have to match the original ingestion for
+   `--replay-only`.** `build_world` generates campaigns *before* users, so the
+   campaign set depends only on `seed` and `n_campaigns`. A `--users` mismatch
+   therefore cannot inject spurious campaigns during a parent re-fetch. Do not
+   rely on this if generation order ever changes.
+
+4. **`fetch_parents=False` makes replay a no-op for orphans**, by design — it
+   is the switch for "re-validate stored payloads only, do not touch the
+   network". A test asserts it recovers nothing and inserts no campaigns.
+
+5. **Replay is idempotent, but the audit tables still grow.** A second replay
+   recovers 0, stops after one round, leaves every data-table count unchanged,
+   and does not resurrect deleted quarantine rows — but it does append another
+   `IngestionRun`. Same append-only rule as Phase 4 gotcha #5.
+
+6. **Requesting only child sources still repairs parents.** `sources=
+   ["touchpoints"]` triggers the campaign re-fetch, because the whole point is
+   to un-orphan the children. The re-fetch is skipped only when no selected
+   source references a campaign (i.e. `conversions` alone) or when
+   `fetch_parents=False`.
+
+7. **Replay reuses the loaders, so in-batch dedupe applies here too.** A model
+   the loader did not reject is treated as recovered, including one dropped as
+   an in-batch duplicate — its twin carried the data into the table, so the
+   quarantine row is genuinely obsolete.
