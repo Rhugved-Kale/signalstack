@@ -3,8 +3,8 @@
 An ad performance attribution pipeline: it ingests campaign and revenue data, runs
 multi-touch attribution, and serves the results to a dashboard.
 
-> Status: Phase 2 — database schema and migrations. No ingestion, attribution,
-> or dashboard logic yet.
+> Status: Phase 3 — synthetic data generator. No ingestion, attribution, or
+> dashboard logic yet.
 
 ## Folder structure
 
@@ -20,6 +20,10 @@ signalstack/
         base.py          # declarative Base
         session.py       # engine, SessionLocal, get_db() dependency
         models.py        # ORM models (7 tables)
+      generator/
+        world.py         # coherent fake world (journeys, spend)
+        fake_apis.py     # fake HTTP APIs with realistic failure modes
+        cli.py           # inspection CLI
       pipeline/          # (empty) ingestion / transform jobs
       attribution/       # (empty) multi-touch attribution logic
     alembic/             # migration environment
@@ -27,6 +31,7 @@ signalstack/
     alembic.ini
     tests/
       test_db.py         # round-trip test against the real database
+      test_generator.py  # generator tests (no database)
     requirements.txt
     .env.example
   frontend/              # Vite + React (JavaScript)
@@ -177,6 +182,22 @@ Requires Postgres up and migrations applied:
 ```bash
 cd backend && .venv/bin/python -m pytest
 ```
+
+## Synthetic data generator
+
+`app.generator` builds an internally consistent fake world — real multi-touch
+user journeys, not random rows — and serves it through fake HTTP-like APIs that
+rate-limit, time out, return 500s, and corrupt records the way real upstreams
+do. It never touches the database; it returns plain dicts.
+
+Inspect a world and write sample API payloads:
+
+```bash
+cd backend && .venv/bin/python -m app.generator.cli --seed 42 --out samples/
+```
+
+The same seed always produces the same world. See PROGRESS.md → "Phase 3" for
+the channel/funnel model and the full list of failure modes.
 
 ## Configuration
 

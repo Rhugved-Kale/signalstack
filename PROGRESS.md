@@ -220,3 +220,164 @@ cd backend && .venv/bin/alembic revision --autogenerate -m "message"
 
 9. Docker Desktop still has to be running before any of this works; the
    container is `signalstack-postgres`.
+
+## Phase 3 — Synthetic data generator
+
+Date: 2026-09-14
+
+Scope: the generator only. It builds a fake world and serves it through fake
+HTTP-like APIs as plain dicts. It does **not** touch the database, does not
+import `app.db` (verified — importing `app.generator` loads no SQLAlchemy,
+psycopg, `app.db` or `app.config` module), and contains no ingestion logic.
+Phase 4 consumes it.
+
+### Files added
+
+- `backend/app/generator/world.py` — the coherent world.
+- `backend/app/generator/fake_apis.py` — three fake APIs with failure modes.
+- `backend/app/generator/cli.py` — inspection CLI.
+- `backend/tests/test_generator.py` — 21 tests, no database.
+
+### The world model
+
+`build_world(WorldConfig(...)) -> World`. Everything derives from one seeded
+`random.Random` plus a Faker seeded identically via `seed_instance`, so a seed
+reproduces a byte-identical world. Defaults: seed 42, 12 campaigns, 800 users,
+a 60-day window ending today, 22% conversion rate.
+
+`World` holds `campaigns`, `users`, `touchpoints`, `conversions` and
+`daily_spend` as plain dicts, plus `summary()`, `channel_breakdown()` and
+`touchpoints_before_conversion()` helpers used by the CLI.
+
+Generation order matters: campaigns → users → journeys (touchpoints +
+conversions) → daily spend. Spend is generated **last and from the journeys**,
+which is what keeps it from contradicting them.
+
+### Funnel bias (the part that makes attribution meaningful)
+
+Each channel has a `funnel_score` on a 0.0 (first touch) .. 1.0 (last touch)
+scale, and a channel is picked per touchpoint by weighting
+`volume_weight * gaussian(funnel_score - position)` with `FUNNEL_SIGMA = 0.25`.
+Organic has `funnel_score = None`, meaning a flat distribution — it can appear
+anywhere.
+
+| Channel | Platform | Funnel | Cost model | Touch types |
+| --- | --- | --- | --- | --- |
+| `display` | `meta_ads` | early (0.10) | CPM $4.50 | impression 92%, click 8% |
+| `social` | `meta_ads` | early/mid (0.30) | CPM $8.00 | impression 60%, click 40% |
+| `affiliate` | `impact` | mid (0.50) | CPC $0.85 | click |
+| `email` | `klaviyo` | late (0.80) | near-zero | email_open 70%, click 30% |
+| `paid_search` | `google_ads` | late (0.90) | CPC $2.40 | click |
+| `organic` | `organic` | any | none (zero) | visit 65%, click 35% |
+
+With seed 42 the bias is stark: display opens 350 journeys and closes 2;
+paid_search opens 0 and closes 237. A test asserts both directions.
+
+Converting users skew longer (weights favour 3-5 touchpoints) than
+non-converters (weights favour 1-2). With seed 42, 67.6% of conversions have
+3+ prior touchpoints, so multi-touch models will have something to disagree
+about.
+
+### Coherence guarantees (all test-enforced)
+
+- A conversion always lands 1-2 days after the user's **last** touchpoint, so
+  it can never precede their first.
+- Reported `impressions`/`clicks` for a campaign-day are always >= the
+  touchpoints actually generated for it, and `impressions >= clicks` always.
+  The touchpoint stream is treated as a *tracked sample* of real activity.
+- Organic touchpoints have `campaign_id = None`; organic campaigns have zero
+  spend, impressions and clicks.
+- Timestamps within a journey are strictly increasing and timezone-aware UTC.
+- Revenue is lognormal (median ~$140), clamped to $25-$900, 2 decimal places.
+- Weekends dip ~20% (measured 19.8% with seed 42).
+
+### Fake APIs and failure modes
+
+Three classes, each `(world, failure_config, seed)`:
+
+| Class | Methods |
+| --- | --- |
+| `FakeAdPlatformAPI` | `list_campaigns`, `list_ad_spend` |
+| `FakeEventStreamAPI` | `list_touchpoints` |
+| `FakePaymentAPI` | `list_conversions` |
+
+Every method rolls the failure dice **first**, then returns the envelope
+`{data, page, per_page, total, total_pages, has_more}`.
+
+Exceptions: `FakeAPIError` (base, `.status_code` + `.message`),
+`RateLimitError` (429, `.retry_after`), `ServerError` (500 or 503),
+`FakeTimeoutError`. `FailureConfig` defaults: 8% server error, 5% rate limit,
+3% timeout, 7% malformed records, 2% duplicates. `FailureConfig.none()`
+returns all-zero rates for deterministic tests.
+
+Nine malformed variants are registered through a `@corruptor(name, requires)`
+decorator into a `CORRUPTORS` list — **add a new one by writing a function**,
+no other code changes. `requires` names the `RecordShape` field that must be
+non-empty for the variant to apply, so e.g. `unexpected_currency` only fires on
+the payment API: missing required key, numeric-as-string, numeric-null,
+timestamp garbage, timestamp-as-unix-int, negative money, unexpected currency,
+empty id, extra unexpected field.
+
+### Running the CLI
+
+```bash
+cd backend && .venv/bin/python -m app.generator.cli --seed 42 --out samples/
+```
+
+Prints the summary, a channel table and the touchpoints-before-conversion
+distribution, and writes sample JSON pages. Also accepts `--campaigns`,
+`--users` and `--days`. `samples/` is gitignored (regenerable output).
+
+```bash
+cd backend && .venv/bin/python -m pytest tests/test_generator.py -q
+```
+
+### Notes / gotchas for future sessions
+
+1. **Money is `float` in these payloads, on purpose.** They imitate JSON, and
+   real JSON APIs send numbers. Phase 4 must convert with
+   `Decimal(str(value))` — never `Decimal(float)` — before touching the
+   `NUMERIC(12,2)` columns.
+
+2. **`campaign_id = None` is legitimate, `campaign_id = ""` is corruption.**
+   Organic touchpoints genuinely have no campaign; the `empty_id` corruptor
+   emits an empty string. Ingestion must treat these differently — null is
+   valid, empty string is quarantine-worthy.
+
+3. **Duplicates make `len(data)` exceed `per_page`.** When
+   `duplicate_record_rate > 0` a page can return more rows than requested,
+   which is why the pagination test uses `FailureConfig.none()`. Real dedupe
+   is the schema's job (the `external_id` unique constraints from Phase 2).
+
+4. **`_roll_failure()` always consumes exactly three RNG draws**, whichever
+   failure fires. That is deliberate: it keeps the random stream aligned so a
+   seed reproduces the same sequence of failures. If you add a fourth failure
+   type, keep the draws unconditional.
+
+5. **An extra unexpected field must not be fatal in Phase 4.** The
+   `extra_unexpected_field` corruptor exists specifically to test that
+   ingestion ignores unknown keys rather than quarantining the record.
+
+6. **Timestamp corruption raises `ValueError`, not just bad values.**
+   `datetime.fromisoformat("0000-00-00")` raises `ValueError: year 0 is out of
+   range`. The parser in Phase 4 needs a `try/except ValueError`, not only a
+   format check — this bit the test helper first time round.
+
+7. **`total` / `total_pages` are computed before corruption**, from the clean
+   record count, so they describe the underlying data rather than the
+   corrupted page.
+
+8. **Invalid `page`/`per_page` raise `ValueError`, not `FakeAPIError`** — that
+   is a caller bug, not an upstream failure. It is raised *after* the failure
+   dice, because the spec requires the dice to roll first.
+
+9. **Spend is sized to the world, not to a real ad account.** 800 users
+   produce ~2,200 touchpoints, so per-campaign volumes are small (a display
+   campaign spends ~$18/day). Blended ROAS lands at 2.87 with seed 42. Raising
+   `n_users` is the honest way to scale volume up; the `daily_impression_base`
+   / `daily_click_base` fields on `ChannelSpec` tune cost per channel.
+
+10. **An organic *campaign* exists even though organic touchpoints carry no
+    campaign_id.** The spec asked for both, so the organic campaign row is
+    real but always has zero spend and zero events. Harmless, but do not treat
+    it as a bug when reconciling.
