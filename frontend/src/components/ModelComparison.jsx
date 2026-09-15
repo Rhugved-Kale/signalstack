@@ -44,24 +44,25 @@ export default function ModelComparison({ state, colors, onRetry }) {
 
   // Grouped bars: 5 per channel, so the container needs room for the group
   // plus the axis band underneath.
-  const chartHeight = Math.max(280, chartRows.length * 68 + 46);
+  const chartHeight = Math.max(280, chartRows.length * 64 + 44);
 
   return (
     <section className="section" aria-labelledby="comparison-heading">
       <div className="section-head">
         <h2 id="comparison-heading" className="section-title">
-          Section 3 · Model comparison
+          How much the models disagree
         </h2>
         <p className="section-note">
-          Each channel&rsquo;s bar height depends entirely on which attribution
-          model you believe. A taller spread within a group means more contested
-          revenue.
+          Each channel&rsquo;s bar length depends entirely on which attribution
+          model you believe. A wider spread within a group means more contested
+          revenue. The five bars run light to dark from first-touch to
+          last-touch.
         </p>
       </div>
 
       <Card
         title="Attributed revenue by channel, under all five models"
-        subtitle="Five bars per channel — one per model. The total across channels is identical for every model; only the split differs."
+        subtitle="Five bars per channel, one per model. Every model distributes the identical total; only the split differs."
       >
         {error && !channels.length ? (
           <InlineError error={error} onRetry={onRetry} />
@@ -108,7 +109,7 @@ export default function ModelComparison({ state, colors, onRetry }) {
                   />
                   <Tooltip
                     content={<ComparisonTooltip colors={colors} />}
-                    cursor={{ fill: colors.grid, fillOpacity: 0.4 }}
+                    cursor={{ fill: colors.grid, fillOpacity: 0.7 }}
                   />
                   {MODEL_ORDER.map((modelName) => (
                     <Bar
@@ -116,8 +117,8 @@ export default function ModelComparison({ state, colors, onRetry }) {
                       dataKey={modelName}
                       name={modelLabel(modelName)}
                       fill={colors.model[modelName]}
-                      radius={[0, 3, 3, 0]}
-                      maxBarSize={11}
+                      radius={[0, 2, 2, 0]}
+                      maxBarSize={9}
                       isAnimationActive
                       animationDuration={520}
                     />

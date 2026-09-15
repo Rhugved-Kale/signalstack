@@ -143,7 +143,7 @@ export default function JourneyExplorer({
       ) : isLoading ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {Array.from({ length: 6 }, (_, index) => (
-            <Skeleton key={index} height={48} radius={10} />
+            <Skeleton key={index} height={46} radius={8} />
           ))}
         </div>
       ) : !journeys.length ? (

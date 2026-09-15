@@ -153,7 +153,8 @@ export default function App() {
             <h1 className="brand-name">SignalStack</h1>
           </div>
           <p className="tagline">
-            Which marketing channel actually drove this revenue?
+            Which marketing channel actually drove this revenue? Five
+            attribution models, one dataset, and the gap between them.
           </p>
         </div>
 
@@ -174,17 +175,14 @@ export default function App() {
         </div>
       </header>
 
-      <div className="control-bar">
+      {/* One control row, no bordered wrapper — this is a control, not a panel. */}
+      <div className="control-row">
         <ModelSelector
           models={models}
           value={model}
           onChange={setModel}
           isLoading={modelsState.isLoading}
         />
-        <p className="section-note" style={{ maxWidth: '46ch' }}>
-          Changing the model re-scores every conversion&rsquo;s journey. Section
-          3 compares all five at once.
-        </p>
       </div>
 
       <HeroStats
@@ -209,7 +207,7 @@ export default function App() {
       <section className="section" aria-labelledby="explorer-heading">
         <div className="section-head">
           <h2 id="explorer-heading" className="section-title">
-            Section 4 · Journeys &amp; pipeline
+            Journeys and pipeline health
           </h2>
           <p className="section-note">
             The concrete version of everything above: one customer&rsquo;s path,
@@ -230,15 +228,7 @@ export default function App() {
         </div>
       </section>
 
-      <footer
-        style={{
-          marginTop: 34,
-          paddingTop: 16,
-          borderTop: '1px solid var(--border)',
-          fontSize: 12.5,
-          color: 'var(--text-3)',
-        }}
-      >
+      <footer className="page-footer">
         SignalStack — synthetic data, five attribution models, one contested
         question. API at <code>{BASE_URL}</code>.
       </footer>

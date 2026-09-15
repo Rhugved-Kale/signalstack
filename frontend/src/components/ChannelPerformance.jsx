@@ -3,7 +3,6 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
-  LabelList,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -53,18 +52,18 @@ export default function ChannelPerformance({ state, model, colors, onRetry }) {
 
   // Size the container to include the axis band so the card never gets a
   // nested scrollbar.
-  const chartHeight = Math.max(200, chartRows.length * 42 + 36);
+  const chartHeight = Math.max(200, chartRows.length * 38 + 34);
 
   return (
     <section className="section" aria-labelledby="channels-heading">
       <div className="section-head">
         <h2 id="channels-heading" className="section-title">
-          Section 2 · Channel performance
+          Channel performance
         </h2>
         <p className="section-note">
-          Attributed revenue by channel under <strong>{model}</strong>. Switch
-          the model above and watch the bars re-order — each channel keeps its
-          colour, so only the ranking moves.
+          Attributed revenue by channel under {model}. Switch the model above
+          and the bars re-order — each channel keeps its colour, so only the
+          ranking moves.
         </p>
       </div>
 
@@ -87,7 +86,7 @@ export default function ChannelPerformance({ state, model, colors, onRetry }) {
                 <BarChart
                   data={chartRows}
                   layout="vertical"
-                  margin={{ top: 4, right: 78, bottom: 4, left: 6 }}
+                  margin={{ top: 4, right: 24, bottom: 4, left: 6 }}
                   barCategoryGap="22%"
                 >
                   <CartesianGrid
@@ -113,15 +112,15 @@ export default function ChannelPerformance({ state, model, colors, onRetry }) {
                   />
                   <Tooltip
                     content={<ChannelTooltip />}
-                    cursor={{ fill: colors.grid, fillOpacity: 0.45 }}
+                    cursor={{ fill: colors.grid, fillOpacity: 0.7 }}
                   />
                   <Bar
                     dataKey="attributed_revenue"
-                    radius={[0, 4, 4, 0]}
+                    radius={[0, 3, 3, 0]}
                     isAnimationActive
                     animationDuration={620}
                     animationEasing="ease-out"
-                    maxBarSize={26}
+                    maxBarSize={18}
                   >
                     {chartRows.map((row) => (
                       <Cell
@@ -129,12 +128,6 @@ export default function ChannelPerformance({ state, model, colors, onRetry }) {
                         fill={colors.channel[row.channel] || colors.fallback}
                       />
                     ))}
-                    <LabelList
-                      dataKey="attributed_revenue"
-                      position="right"
-                      formatter={moneyCompact}
-                      style={{ fill: 'var(--text-2)', fontSize: 11.5 }}
-                    />
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
