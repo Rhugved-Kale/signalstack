@@ -72,19 +72,19 @@ function DisagreementSpotlight({ disagreement }) {
 
       {hasBothSides && (
         <div className="spotlight-figures">
-          <div>
+          <div className="spotlight-figure">
             <div className="spotlight-figure-label">
               {modelLabel(generousModel)}
             </div>
             <div className="spotlight-figure-value">{moneyWhole(high)}</div>
           </div>
-          <div>
+          <div className="spotlight-figure">
             <div className="spotlight-figure-label">
               {modelLabel(stingyModel)}
             </div>
             <div className="spotlight-figure-value">{moneyWhole(low)}</div>
           </div>
-          <div>
+          <div className="spotlight-figure">
             <div className="spotlight-figure-label">Contested</div>
             <div className="spotlight-figure-value is-swing">
               {moneyWhole(swing)}

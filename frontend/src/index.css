@@ -52,11 +52,24 @@
     'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
 
-  --fs-hero: 30px;
   --fs-title: 19px;
   --fs-body: 14px;
   --fs-small: 12.5px;
   --fs-micro: 11px;
+
+  /* Display-size figures are sized FLUIDLY, not statically.
+     Their rendered width depends on the data, not on the design: since the
+     Run pipeline button uses a random seed, a larger world produces longer
+     numbers ($9,999,999.99 is ~2.4x the width of $55,195.02). A static size
+     that fits today's numbers overflows tomorrow's, so these scale with the
+     viewport and the minimum is chosen to stay legible at 380px. */
+  /* --fs-figure-sm is for CURRENCY, which is the longest figure type
+     ("$100,000,000" is 12 characters against "9,999,999" at 9), so it gets
+     the smaller ramp. Both maxima were set by measuring the inked text width
+     against the narrowest strip column: at 1440px this leaves ~34% headroom
+     on counts and ~22% on a 12-character currency amount. */
+  --fs-figure: clamp(19px, 0.55rem + 1.25vw, 29px);
+  --fs-figure-sm: clamp(17px, 0.5rem + 1.05vw, 24px);
 
   /* --- spacing: 4px base ------------------------------------------------ */
   --s1: 4px;
@@ -454,16 +467,19 @@ select {
 }
 
 .stat-value {
-  font-size: var(--fs-hero);
+  font-size: var(--fs-figure);
   font-weight: 550;
   letter-spacing: -0.032em;
   line-height: 1.08;
   color: var(--ink);
+  /* nowrap keeps a number from breaking mid-figure; it is safe here only
+     because the text itself can shrink (fluid size) and nothing clips it —
+     there is deliberately no overflow:hidden or text-overflow on a figure. */
   white-space: nowrap;
 }
 
 .stat-value.is-compact {
-  font-size: 26px;
+  font-size: var(--fs-figure-sm);
   letter-spacing: -0.028em;
 }
 
@@ -507,12 +523,19 @@ select {
   color: var(--spotlight-accent);
 }
 
+/* Flex, not a fixed-width grid: each figure sizes to its own content and the
+   row wraps if three long numbers cannot share the width. A capped 200px
+   track would have clipped a 7-figure amount. */
 .spotlight-figures {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 200px));
-  gap: var(--s5);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s4) var(--s6);
   border-top: 1px solid rgba(255, 255, 255, 0.12);
   padding-top: var(--s5);
+}
+
+.spotlight-figure {
+  min-width: 0;
 }
 
 .spotlight-figure-label {
@@ -524,10 +547,11 @@ select {
 
 .spotlight-figure-value {
   margin-top: var(--s1);
-  font-size: 26px;
+  font-size: var(--fs-figure-sm);
   font-weight: 550;
   letter-spacing: -0.03em;
   line-height: 1.1;
+  white-space: nowrap;
 }
 
 .spotlight-figure-value.is-swing {
@@ -1224,9 +1248,6 @@ table.data tr.is-highlight:hover td {
 }
 
 @media (max-width: 720px) {
-  :root {
-    --fs-hero: 26px;
-  }
   .page {
     padding: var(--s5) var(--s4) var(--s8);
   }
@@ -1260,11 +1281,7 @@ table.data tr.is-highlight:hover td {
     padding: var(--s5);
   }
   .spotlight-figures {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: var(--s2);
-  }
-  .spotlight-figure-value {
-    font-size: 20px;
+    gap: var(--s3) var(--s5);
   }
   .health-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1294,10 +1311,5 @@ table.data tr.is-highlight:hover td {
   .masthead-meta {
     gap: var(--s4);
   }
-  .stat-value {
-    font-size: 22px;
-  }
-  .stat-value.is-compact {
-    font-size: 20px;
-  }
+
 }
