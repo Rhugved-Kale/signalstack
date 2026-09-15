@@ -89,3 +89,134 @@ Date: 2026-09-14
 No database models, migrations (alembic is installed but not initialized —
 there is no `alembic.ini` or `versions/` tree yet), pipeline code, attribution
 logic, additional API endpoints, or deployment.
+
+## Phase 2 — Database schema
+
+Date: 2026-09-14
+
+Scope: schema and migrations only. No ingestion, attribution, API endpoints, or
+seed data — those remain for later phases.
+
+### Port change: 5433 (resolves the Phase 1 gotcha)
+
+Phase 1 note #2 documented a collision on port 5432: a Homebrew
+`postgresql@16` service binds the specific loopback addresses, the container
+bound the wildcard, and the specific bind wins — so `localhost:5432` reached
+Homebrew Postgres, not our container.
+
+Resolved by moving the container's **host** port to 5433 (`"5433:5432"` in
+`docker-compose.yml`); the container still listens on 5432 internally. The
+Homebrew service was left running and untouched, so port 5432 still belongs to
+it. The new port is reflected in three places:
+
+- `docker-compose.yml` → `ports: ["5433:5432"]`
+- `backend/app/config.py` → `DATABASE_URL` default
+- `backend/.env.example`, and a new **gitignored** `backend/.env`
+
+Proof that 5433 reaches the container: `SELECT version()` on 5433 returns
+`PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) ... aarch64-unknown-linux-gnu` with
+`inet_server_addr() = 172.19.0.2`, whereas 5432 still returns
+`PostgreSQL 16.13 (Homebrew) ... aarch64-apple-darwin`.
+
+### Tables
+
+Seven application tables (plus Alembic's own `alembic_version`):
+
+| Table | Purpose |
+| --- | --- |
+| `campaigns` | Campaign dimension, keyed to the upstream platform by `external_id`. Parent of ad spend and touchpoints. |
+| `ad_spend` | Daily cost facts per campaign (spend/impressions/clicks) — the denominator for ROAS. |
+| `touchpoints` | Individual marketing interactions per `user_id`; the journey that attribution walks. `campaign_id` is nullable so organic/direct touches can exist. |
+| `conversions` | Revenue events to be attributed, keyed by the payment API's order id. |
+| `attribution_results` | Credit per (conversion, touchpoint, model). Holds every model's answer side by side rather than overwriting. |
+| `ingestion_runs` | One row per ingestion attempt: counts, status, retry count, error. The pipeline's audit log. |
+| `quarantined_records` | Records that failed validation, with the original payload kept verbatim in `JSONB` for replay. |
+
+Conventions: SQLAlchemy 2.0 `Mapped`/`mapped_column`; integer surrogate `id` on
+every table; all timestamps `TIMESTAMP WITH TIME ZONE`; all money
+`NUMERIC(12,2)` and `credit` `NUMERIC(8,6)` — no floats anywhere.
+
+Idempotency is enforced in the schema, not in code: `ad_spend` is unique on
+`(campaign_id, date)`, `attribution_results` on
+`(conversion_id, touchpoint_id, model_name)`, and `external_id` is unique on
+`campaigns`, `touchpoints`, and `conversions`. Re-ingesting the same data should
+therefore conflict rather than duplicate.
+
+### Files added
+
+- `backend/app/db/base.py` — declarative `Base`, isolated so models and
+  Alembic's `env.py` can both import it without a cycle.
+- `backend/app/db/session.py` — `engine` (with `pool_pre_ping=True`),
+  `SessionLocal`, and the `get_db()` FastAPI dependency.
+- `backend/app/db/models.py` — the seven models.
+- `backend/alembic.ini`, `backend/alembic/` — migration environment.
+- `backend/alembic/versions/bc011872e3ef_initial_schema.py` — initial schema.
+- `backend/tests/test_db.py` — real-database round-trip test.
+
+### Running migrations
+
+All Alembic commands run from `backend/`:
+
+```bash
+cd backend && .venv/bin/alembic upgrade head      # apply
+cd backend && .venv/bin/alembic downgrade base    # roll all the way back
+cd backend && .venv/bin/alembic current           # show applied revision
+cd backend && .venv/bin/alembic check             # detect model/DB drift
+cd backend && .venv/bin/alembic revision --autogenerate -m "message"
+```
+
+### Verification performed
+
+- Autogenerate produced all 7 tables, 5 foreign keys, 5 unique constraints and
+  10 indexes on the first pass — **no hand-editing of the migration was
+  needed**. Confirmed by reading the file and by `alembic check` reporting
+  "No new upgrade operations detected".
+- `\dt` shows 8 tables; `alembic_version` holds `bc011872e3ef`.
+- Reversibility: `downgrade base` left 0 application tables, then
+  `upgrade head` restored all 7, with `alembic check` still clean afterwards.
+- `pytest` — 1 passed, against the real Postgres, leaving no residual rows.
+
+### Notes / gotchas for future sessions
+
+1. **`alembic/env.py` ignores `alembic.ini` for the URL.** It imports
+   `app.config.settings` and calls `config.set_main_option("sqlalchemy.url", ...)`,
+   so `DATABASE_URL` has exactly one source of truth. The `sqlalchemy.url` key in
+   `alembic.ini` is deliberately left blank — do not put credentials there.
+
+2. **Run Alembic and pytest from `backend/`.** `config.py` sets
+   `env_file=".env"`, which resolves relative to the *current working
+   directory*, so `backend/.env` is only picked up from there. (Defaults in
+   `config.py` also point at 5433, so a wrong cwd happens to still work today —
+   it will stop being harmless once `.env` diverges from the defaults.)
+
+3. **`env.py` inserts `backend/` into `sys.path`** so the `app` package imports
+   regardless of how Alembic is invoked.
+
+4. **`tests/__init__.py` is what makes `from app...` work under pytest** — it
+   makes `tests` a package, so pytest inserts `backend/` (not `backend/tests/`)
+   onto `sys.path`. Don't delete it.
+
+5. **The single-column unique constraints are DB-named**, e.g.
+   `campaigns_external_id_key`, because they come from `unique=True` on the
+   column rather than a named `UniqueConstraint`. The composite ones are
+   explicitly named (`uq_ad_spend_campaign_date`,
+   `uq_attribution_conversion_touchpoint_model`). If you later want fully
+   predictable names everywhere, add a naming convention to `Base.metadata` —
+   that will require a migration to rename.
+
+6. **No ORM `relationship()` attributes were defined** — only the raw foreign
+   keys the spec called for. Add them in the phase that needs to traverse
+   journeys (attribution will want `Conversion` → `Touchpoint`), and remember
+   relationships need no migration.
+
+7. **No `ON DELETE` behaviour was specified**, so foreign keys use Postgres's
+   default `NO ACTION`. Deleting a campaign with spend or touchpoints attached
+   will therefore raise. Decide on cascade rules when deletion becomes a real
+   workflow.
+
+8. **The `ad_spend.date` column shadows the `date` type name.** `models.py`
+   imports `datetime as dt` and annotates `Mapped[dt.date]` to avoid the
+   collision — keep that style if you add more date columns.
+
+9. Docker Desktop still has to be running before any of this works; the
+   container is `signalstack-postgres`.

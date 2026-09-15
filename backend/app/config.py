@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     DATABASE_URL: str = (
-        "postgresql+psycopg://signalstack:signalstack@localhost:5432/signalstack"
+        "postgresql+psycopg://signalstack:signalstack@localhost:5433/signalstack"
     )
     CORS_ORIGINS: str = "http://localhost:5173"
     ENVIRONMENT: str = "local"
